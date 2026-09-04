@@ -200,6 +200,16 @@ case "$BATCH_SIZE" in
     ''|*[!0-9]*|0) die "BATCH_SIZE must be a positive integer" ;;
 esac
 
+# adb shell re-splits the command on the device, so an unquoted path with
+# whitespace would break every remote loop.
+case "$REMOTE_DIR" in
+    *[[:space:]]*) die "REMOTE_DIR must not contain whitespace: $REMOTE_DIR" ;;
+esac
+
+# Paths sent per adb shell invocation, to stay well inside the device's
+# argument length limit.
+SCAN_CHUNK=100
+
 IMMICH_URL="${IMMICH_URL%/}"
 
 [ -n "$IMMICH_API_KEY" ] || die "IMMICH_API_KEY is not set. Create $CONFIG_FILE (mode 600) containing:
@@ -303,9 +313,18 @@ transport_push() {
     "${ADB[@]}" push "$1" "$REMOTE_DIR/$2" >/dev/null </dev/null
 }
 
-transport_scan_file() {
-    "${ADB[@]}" shell content call --uri content://media \
-        --method scan_file --arg "$REMOTE_DIR/$1" >/dev/null 2>&1 </dev/null
+# Scan a batch of files in one adb round trip. The device-side loop echoes one
+# line per file so the host can still drive a progress bar. Remote names are
+# sanitised to [A-Za-z0-9._-] at push time, so they need no quoting here.
+transport_scan_batch() {
+    local cmd='for f in' name
+    for name in "$@"; do
+        cmd="$cmd $REMOTE_DIR/$name"
+    done
+    cmd="$cmd; do content call --uri content://media --method scan_file"
+    cmd="$cmd --arg \$f >/dev/null 2>&1 && echo Y || echo N; done"
+
+    "${ADB[@]}" shell "$cmd" 2>/dev/null </dev/null | tr -d '\r'
 }
 
 transport_scan_volume() {
@@ -557,26 +576,40 @@ advance_cursor() {
 flush_batch() {
     [ "${#batch_names[@]}" -gt 0 ] || return 0
 
-    local name failures=0 done_n=0 t0=$SECONDS
+    local total="${#batch_names[@]}"
+    local failures=0 done_n=0 t0=$SECONDS i=0 verdict
 
     if [ "$SCAN_VOLUME" -eq 1 ]; then
-        transport_scan_volume || warn "volume scan failed"
+        render_progress 0 "$total" 0 0 "indexing $total file(s)"
+        transport_scan_volume || failures="$total"
     else
-        for name in "${batch_names[@]}"; do
-            render_progress "$done_n" "${#batch_names[@]}" 0 $(( SECONDS - t0 )) "indexing ${name#*_}"
-            transport_scan_file "$name" || failures=$(( failures + 1 ))
-            done_n=$(( done_n + 1 ))
+        while [ "$i" -lt "$total" ]; do
+            while read -r verdict <&3; do
+                if [ "$done_n" -lt "$total" ]; then
+                    [ "$verdict" = "N" ] && failures=$(( failures + 1 ))
+                    render_progress "$done_n" "$total" 0 $(( SECONDS - t0 )) \
+                        "indexing ${batch_names[done_n]#*_}"
+                fi
+                done_n=$(( done_n + 1 ))
+            done 3< <(transport_scan_batch "${batch_names[@]:i:SCAN_CHUNK}")
+            i=$(( i + SCAN_CHUNK ))
         done
-        if [ "$failures" -gt 0 ]; then
-            warn "$failures file scan(s) failed; falling back to a volume scan"
-            transport_scan_volume ||
-                warn "volume scan failed too - open Google Photos on the phone once, or use --scan-volume"
+        # Fewer replies than files means the remote shell died partway through.
+        [ "$done_n" -lt "$total" ] && failures=$(( failures + total - done_n ))
+    fi
+
+    if [ "$failures" -gt 0 ]; then
+        warn "$failures scan(s) failed; falling back to a volume scan"
+        if ! transport_scan_volume; then
+            warn "volume scan failed too - leaving this batch uncommitted so it retries next run"
+            cursor_frozen=1
+            return 1
         fi
     fi
 
     printf '%s\n' "${batch_ids[@]}" >> "$PUSHED_FILE"
     advance_cursor "$batch_cursor"
-    indexed=$(( indexed + ${#batch_names[@]} ))
+    indexed=$(( indexed + total ))
     batch_names=()
     batch_ids=()
     return 0
