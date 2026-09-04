@@ -7,6 +7,10 @@
 # Copies assets newly added to Immich (for the user owning the API key) onto a
 # Pixel over adb, into a folder that Google Photos is configured to back up.
 #
+# Work proceeds in batches: push BATCH_SIZE files, register them with MediaStore
+# so Google Photos starts uploading, then continue. An asset is only recorded as
+# done once it has been indexed, and files awaiting indexing are never pruned.
+#
 # Host requirements:  bash, curl, jq, adb
 #
 # One-time phone setup:
@@ -25,7 +29,7 @@
 # Values in the config file take precedence over environment variables.
 #
 # Usage:  immich-to-pixel.sh [--dry-run] [--limit N] [--since ISO8601]
-#                            [--scan-volume] [--config PATH]
+#                            [--batch N] [--scan-volume] [--config PATH]
 
 set -euo pipefail
 
@@ -132,14 +136,15 @@ Usage: immich-to-pixel.sh [options]
   --dry-run        List what would be transferred; change nothing.
   --limit N        Stop after N assets. Useful for the first backlog run.
   --since ISO8601  Ignore the saved cursor and start from this timestamp.
-  --scan-volume    Trigger one full MediaStore volume scan instead of
+  --batch N        Push N files, then index them, then continue (default 50).
+  --scan-volume    Trigger one full MediaStore volume scan per batch instead of
                    scanning each pushed file individually.
   --config PATH    Config file (default ~/.config/immich-to-pixel.conf).
   -h, --help       Show this help.
 
 Settings (config file wins over environment):
   IMMICH_URL, IMMICH_API_KEY, PIXEL_ADDR, REMOTE_DIR, STATE_DIR,
-  KEEP_DAYS, MIN_FREE_MB, PAGE_SIZE
+  KEEP_DAYS, MIN_FREE_MB, PAGE_SIZE, BATCH_SIZE
 EOF
 }
 
@@ -150,6 +155,7 @@ EOF
 CONFIG_FILE="${IMMICH_TO_PIXEL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/immich-to-pixel.conf}"
 DRY_RUN=0
 LIMIT=0
+BATCH_OVERRIDE=""
 SCAN_VOLUME=0
 SINCE_OVERRIDE=""
 
@@ -158,6 +164,7 @@ while [ $# -gt 0 ]; do
         --dry-run)     DRY_RUN=1; shift ;;
         --scan-volume) SCAN_VOLUME=1; shift ;;
         --limit)       LIMIT="${2:?--limit needs a value}"; shift 2 ;;
+        --batch)       BATCH_OVERRIDE="${2:?--batch needs a value}"; shift 2 ;;
         --since)       SINCE_OVERRIDE="${2:?--since needs a value}"; shift 2 ;;
         --config)      CONFIG_FILE="${2:?--config needs a value}"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
@@ -186,6 +193,12 @@ STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/immich-to-pixel}"
 KEEP_DAYS="${KEEP_DAYS:-7}"
 MIN_FREE_MB="${MIN_FREE_MB:-8192}"
 PAGE_SIZE="${PAGE_SIZE:-500}"
+BATCH_SIZE="${BATCH_SIZE:-50}"
+[ -n "$BATCH_OVERRIDE" ] && BATCH_SIZE="$BATCH_OVERRIDE"
+
+case "$BATCH_SIZE" in
+    ''|*[!0-9]*|0) die "BATCH_SIZE must be a positive integer" ;;
+esac
 
 IMMICH_URL="${IMMICH_URL%/}"
 
@@ -219,6 +232,14 @@ new_cursor="$cursor"
 
 WORK_DIR="$(mktemp -d)"
 chmod 700 "$WORK_DIR"
+
+# Remote filenames pushed but not yet indexed. Google Photos has had no chance
+# to see these, so pruning must leave them alone.
+PROTECT_FILE="$WORK_DIR/protect.txt"
+: > "$PROTECT_FILE"
+declare -a batch_names=()
+declare -a batch_ids=()
+batch_cursor=""
 
 finish() {
     local rc=$?
@@ -335,17 +356,38 @@ file_size_kb() {
     echo $(( (bytes + 1023) / 1024 ))
 }
 
+write_protect_file() {
+    : > "$PROTECT_FILE"
+    if [ "${#batch_names[@]}" -gt 0 ]; then
+        printf '%s\n' "${batch_names[@]}" > "$PROTECT_FILE"
+    fi
+}
+
+# Drop protected names from a newline-separated list. Keyed on FILENAME because
+# NR==FNR misfires when the protect file is empty.
+filter_protected() {
+    awk -v pf="$PROTECT_FILE" '
+        FILENAME == pf { protected[$0] = 1; next }
+        !($0 in protected)
+    ' "$PROTECT_FILE" "$1"
+}
+
 # prune_remote [extra_kb] - free space until MIN_FREE_MB + extra_kb is available.
 prune_remote() {
     local need_kb="${1:-0}"
     local deleted=0
     local target_kb=$(( MIN_FREE_MB * 1024 + need_kb ))
+    local raw="$WORK_DIR/prune.raw"
+
+    write_protect_file
+
+    "${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null </dev/null |
+        tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d' > "$raw" || true
 
     local -a stale=()
     while read -r name; do
         [ -n "$name" ] && stale+=("$name")
-    done < <("${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null </dev/null |
-        tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d')
+    done < <(filter_protected "$raw")
 
     if [ "${#stale[@]}" -gt 0 ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
@@ -364,11 +406,12 @@ prune_remote() {
     fi
 
     if [ "$FREE_KB" -lt "$target_kb" ]; then
-        # Oldest first, so anything pushed during this run is sacrificed last.
+        # Oldest indexed file first: it has had the longest to upload.
+        transport_list_oldest_first > "$raw"
         local -a oldest=()
         while read -r name; do
             [ -n "$name" ] && oldest+=("$name")
-        done < <(transport_list_oldest_first)
+        done < <(filter_protected "$raw")
 
         local i=0
         while [ "$FREE_KB" -lt "$target_kb" ] && [ "$i" -lt "${#oldest[@]}" ]; do
@@ -481,9 +524,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
         die "could not create $REMOTE_DIR on the device"
 fi
 
-prune_remote
-
 pushed=0
+indexed=0
 skipped=0
 failed=0
 processed=0
@@ -491,7 +533,8 @@ cursor_frozen=0
 device_full=0
 sent_kb=0
 start_time=$SECONDS
-declare -a scanned=()
+
+prune_remote
 
 # Denominator for the progress bar: rows that will actually be transferred.
 if [ "$LIMIT" -gt 0 ]; then
@@ -508,6 +551,37 @@ advance_cursor() {
     fi
 }
 
+# Index the pending batch, then commit it. Recording assets before they are
+# indexed would let an interrupted run mark work complete that Google Photos
+# never saw, and those assets would never be retried.
+flush_batch() {
+    [ "${#batch_names[@]}" -gt 0 ] || return 0
+
+    local name failures=0 done_n=0 t0=$SECONDS
+
+    if [ "$SCAN_VOLUME" -eq 1 ]; then
+        transport_scan_volume || warn "volume scan failed"
+    else
+        for name in "${batch_names[@]}"; do
+            render_progress "$done_n" "${#batch_names[@]}" 0 $(( SECONDS - t0 )) "indexing ${name#*_}"
+            transport_scan_file "$name" || failures=$(( failures + 1 ))
+            done_n=$(( done_n + 1 ))
+        done
+        if [ "$failures" -gt 0 ]; then
+            warn "$failures file scan(s) failed; falling back to a volume scan"
+            transport_scan_volume ||
+                warn "volume scan failed too - open Google Photos on the phone once, or use --scan-volume"
+        fi
+    fi
+
+    printf '%s\n' "${batch_ids[@]}" >> "$PUSHED_FILE"
+    advance_cursor "$batch_cursor"
+    indexed=$(( indexed + ${#batch_names[@]} ))
+    batch_names=()
+    batch_ids=()
+    return 0
+}
+
 # Read on fd 3, never stdin: a subprocess that drains fd 0 would silently
 # truncate the run.
 while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
@@ -521,7 +595,13 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
     if [ "$state" = "skip" ]; then
         skipped=$(( skipped + 1 ))
         processed=$(( processed + 1 ))
-        advance_cursor "$updated_at"
+        # With a batch outstanding, this timestamp is ahead of uncommitted work,
+        # so it has to be committed by the flush rather than immediately.
+        if [ "${#batch_names[@]}" -eq 0 ]; then
+            advance_cursor "$updated_at"
+        else
+            batch_cursor="$updated_at"
+        fi
         continue
     fi
 
@@ -537,7 +617,6 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
         advance_cursor "$updated_at"
         continue
     fi
-
     # Drawn before the download so a slow fetch still shows the current file.
     render_progress "$pushed" "$to_send" "$sent_kb" $(( SECONDS - start_time )) "${remote_name#*_}"
 
@@ -558,23 +637,31 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
 
     need_kb="$(file_size_kb "$src")"
     if ! ensure_space "$need_kb"; then
-        warn "device full: cannot fit $remote_name (needs ${need_kb}KB, ${FREE_KB}KB free, reserving ${MIN_FREE_MB}MB)"
-        [ "$downloaded" -eq 1 ] && rm -f "$src"
-        cursor_frozen=1
-        device_full=1
-        break
+        # The outstanding batch is protected from pruning. Index it first: that
+        # releases it for reuse and is usually enough to continue.
+        flush_batch
+        if ! ensure_space "$need_kb"; then
+            warn "device full: cannot fit $remote_name (needs ${need_kb}KB, ${FREE_KB}KB free, reserving ${MIN_FREE_MB}MB)"
+            [ "$downloaded" -eq 1 ] && rm -f "$src"
+            cursor_frozen=1
+            device_full=1
+            break
+        fi
     fi
 
     if transport_push "$src" "$remote_name"; then
-        printf '%s\n' "$id" >> "$PUSHED_FILE"
-        scanned+=("$remote_name")
+        batch_names+=("$remote_name")
+        batch_ids+=("$id")
+        batch_cursor="$updated_at"
         pushed=$(( pushed + 1 ))
         processed=$(( processed + 1 ))
-        advance_cursor "$updated_at"
         if [ "$FREE_KB" -ge 0 ]; then
             FREE_KB=$(( FREE_KB - need_kb ))
         fi
         sent_kb=$(( sent_kb + need_kb ))
+        if [ "${#batch_names[@]}" -ge "$BATCH_SIZE" ]; then
+            flush_batch
+        fi
     else
         warn "push failed: $remote_name"
         failed=$(( failed + 1 ))
@@ -585,38 +672,9 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
     [ "$downloaded" -eq 1 ] && rm -f "$src"
 done 3< "$QUEUE"
 
+flush_batch
 render_progress "$pushed" "$to_send" "$sent_kb" $(( SECONDS - start_time )) "complete"
 finish_progress
-
-# ------------------------------------------------------------
-# MEDIA SCAN
-#
-# Google Photos backs up what MediaStore indexes, not what is on disk. Pushed
-# files stay invisible until scanned.
-# ------------------------------------------------------------
-
-if [ "$DRY_RUN" -eq 0 ] && [ "${#scanned[@]}" -gt 0 ]; then
-    if [ "$SCAN_VOLUME" -eq 1 ]; then
-        info "triggering full volume scan"
-        transport_scan_volume || warn "volume scan failed"
-    else
-        scan_failures=0
-        scan_done=0
-        scan_start=$SECONDS
-        for name in "${scanned[@]}"; do
-            render_progress "$scan_done" "${#scanned[@]}" 0 $(( SECONDS - scan_start )) "indexing ${name#*_}"
-            transport_scan_file "$name" || scan_failures=$(( scan_failures + 1 ))
-            scan_done=$(( scan_done + 1 ))
-        done
-        render_progress "$scan_done" "${#scanned[@]}" 0 $(( SECONDS - scan_start )) "indexing complete"
-        finish_progress
-        if [ "$scan_failures" -gt 0 ]; then
-            warn "$scan_failures file scan(s) failed; falling back to a volume scan"
-            transport_scan_volume ||
-                warn "volume scan failed too - open Google Photos on the phone once, or retry with --scan-volume"
-        fi
-    fi
-fi
 
 # ------------------------------------------------------------
 # SUMMARY
@@ -624,6 +682,7 @@ fi
 
 printf '\n'
 printf '%-12s %s\n' "Pushed" "$pushed"
+printf '%-12s %s\n' "Indexed" "$indexed"
 printf '%-12s %s\n' "Skipped" "$skipped"
 printf '%-12s %s\n' "Failed" "$failed"
 printf '%-12s %s\n' "Cursor" "$new_cursor"
