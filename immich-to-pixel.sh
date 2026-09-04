@@ -257,46 +257,50 @@ immich_user="$(jq -r '.email // .name // "unknown"' <<<"$me_json")"
 
 declare -a ADB=()
 
+# Every adb call gets </dev/null. `adb shell` forwards stdin to the remote
+# command, so without this it drains whatever fd 0 happens to be - including the
+# queue being read by the transfer loop.
 transport_connect() {
     if [ -z "$PIXEL_ADDR" ]; then
-        PIXEL_ADDR="$(adb mdns services 2>/dev/null |
+        PIXEL_ADDR="$(adb mdns services 2>/dev/null </dev/null |
             awk '/_adb-tls-connect/ { print $3; exit }')"
         [ -n "$PIXEL_ADDR" ] ||
             die "no PIXEL_ADDR set and mDNS discovery found no adb-tls-connect service"
         info "discovered device at $PIXEL_ADDR"
     fi
 
-    adb connect "$PIXEL_ADDR" >/dev/null 2>&1 || true
+    adb connect "$PIXEL_ADDR" >/dev/null 2>&1 </dev/null || true
     ADB=(adb -s "$PIXEL_ADDR")
 
     local state
-    state="$("${ADB[@]}" get-state 2>/dev/null || true)"
+    state="$("${ADB[@]}" get-state 2>/dev/null </dev/null || true)"
     [ "$state" = "device" ] ||
         die "device $PIXEL_ADDR is not available (state: ${state:-offline}). Re-pair wireless debugging, or run 'adb -d tcpip 5555' over USB to pin the port."
 }
 
 transport_push() {
-    "${ADB[@]}" push "$1" "$REMOTE_DIR/$2" >/dev/null
+    "${ADB[@]}" push "$1" "$REMOTE_DIR/$2" >/dev/null </dev/null
 }
 
 transport_scan_file() {
     "${ADB[@]}" shell content call --uri content://media \
-        --method scan_file --arg "$REMOTE_DIR/$1" >/dev/null 2>&1
+        --method scan_file --arg "$REMOTE_DIR/$1" >/dev/null 2>&1 </dev/null
 }
 
 transport_scan_volume() {
     "${ADB[@]}" shell content call --uri content://media \
-        --method scan_volume --arg external_primary >/dev/null 2>&1
+        --method scan_volume --arg external_primary >/dev/null 2>&1 </dev/null
 }
 
 # Available space on the shared volume, in KiB. Empty if unparseable.
 transport_free_kb() {
-    "${ADB[@]}" shell df -k "$REMOTE_DIR" 2>/dev/null |
+    "${ADB[@]}" shell df -k "$REMOTE_DIR" 2>/dev/null </dev/null |
         awk 'NR==2 && $4 ~ /^[0-9]+$/ { print $4 }'
 }
 
 transport_list_oldest_first() {
-    "${ADB[@]}" shell ls -t "$REMOTE_DIR" 2>/dev/null | tr -d '\r' | sed '/^$/d' |
+    "${ADB[@]}" shell ls -t "$REMOTE_DIR" 2>/dev/null </dev/null |
+        tr -d '\r' | sed '/^$/d' |
         awk '{ line[NR] = $0 } END { for (i = NR; i >= 1; i--) print line[i] }'
 }
 
@@ -340,7 +344,7 @@ prune_remote() {
     local -a stale=()
     while read -r name; do
         [ -n "$name" ] && stale+=("$name")
-    done < <("${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null |
+    done < <("${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null </dev/null |
         tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d')
 
     if [ "${#stale[@]}" -gt 0 ]; then
@@ -473,7 +477,7 @@ awk -F'\t' -v pushed="$PUSHED_FILE" '
 transport_connect
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 ||
+    "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 </dev/null ||
         die "could not create $REMOTE_DIR on the device"
 fi
 
@@ -504,7 +508,9 @@ advance_cursor() {
     fi
 }
 
-while IFS=$'\t' read -r state id updated_at orig_path orig_name; do
+# Read on fd 3, never stdin: a subprocess that drains fd 0 would silently
+# truncate the run.
+while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
     [ -n "$id" ] || continue
 
     if [ "$LIMIT" -gt 0 ] && [ "$processed" -ge "$LIMIT" ]; then
@@ -577,7 +583,7 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name; do
     fi
 
     [ "$downloaded" -eq 1 ] && rm -f "$src"
-done < "$QUEUE"
+done 3< "$QUEUE"
 
 render_progress "$pushed" "$to_send" "$sent_kb" $(( SECONDS - start_time )) "complete"
 finish_progress
