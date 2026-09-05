@@ -211,7 +211,10 @@ if [ "$oc" -gt 0 ]; then
     note crit "$oc USB over-current incidents, meaning the bus cut power to attached devices"
 fi
 
-if jrn -b 0 --no-pager -k | grep -qiE 'thermal shutdown|critical temperature'; then
+# grep -q would exit early and SIGPIPE journalctl, which pipefail reports as a
+# failed pipeline. That would silently miss the very event being looked for.
+thermal="$(jrn -b 0 --no-pager -k | grep -ciE 'thermal shutdown|critical temperature' || true)"
+if [ "${thermal:-0}" -gt 0 ]; then
     HAS_THERMAL=1
     note crit "thermal shutdown was reported"
 fi

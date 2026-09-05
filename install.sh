@@ -413,8 +413,15 @@ install_timer_launchd() {
 </plist>
 EOF
 
-    run launchctl unload "$plist" 2>/dev/null || true
-    run launchctl load -w "$plist"
+    # load -w is deprecated and fails quietly on current macOS, which leaves the
+    # agent unloaded after the preceding unload. bootstrap reports properly.
+    local domain
+    domain="gui/$(id -u)"
+    run launchctl bootout "$domain/$label" 2>/dev/null || true
+    if ! run launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+        run launchctl load -w "$plist" 2>/dev/null || true
+    fi
+    run launchctl enable "$domain/$label" 2>/dev/null || true
     kv "$name" "launchd agent ($when)"
 }
 
@@ -458,8 +465,11 @@ do_timers() {
 timer_status() {
     local name="$1"
     if is_macos; then
-        local label="$LAUNCHD_PREFIX.$name"
-        if launchctl list 2>/dev/null | grep -q "$label"; then
+        local label="$LAUNCHD_PREFIX.$name" hits
+        # grep -q exits on the first match and SIGPIPEs launchctl, which under
+        # pipefail reads as a failed pipeline. Count instead of short circuiting.
+        hits="$(launchctl list 2>/dev/null | grep -c "$label" || true)"
+        if [ "${hits:-0}" -gt 0 ]; then
             echo "loaded"
         elif [ -f "$HOME/Library/LaunchAgents/$label.plist" ]; then
             echo "plist present, not loaded"

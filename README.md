@@ -98,6 +98,15 @@ Persistent state lives in `~/.local/state/<script-name>/`. That includes sync cu
 
 Every script supports `--help` and, where it can change anything, `--dry-run`. Output on stdout stays pipeable, while progress bars and diagnostics go to stderr.
 
+### Pipelines under set -o pipefail
+
+Every script sets `pipefail`, which makes two common idioms unsafe:
+
+- `producer | grep -q pattern` exits on the first match and sends SIGPIPE to the producer, so the pipeline reports failure even though the match succeeded. Count with `grep -c` instead, since that reads all input.
+- `x="$(cmd 2>/dev/null || echo fallback)"` keeps whatever the failing command already wrote to stdout and appends the fallback. Capture first, then test.
+
+Both have caused real bugs here, including a check that silently could not detect a thermal shutdown.
+
 ### Exit codes
 
 | Code | Meaning |

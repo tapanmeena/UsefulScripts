@@ -247,7 +247,8 @@ if [ -n "$TEST_KIND" ]; then
     started=0
     while IFS="$TAB" read -r dev type; do
         [ -n "$dev" ] || continue
-        if smart -t "$TEST_KIND" -d "$type" "$dev" | grep -qi 'test has begun\|testing has begun'; then
+        started_ok="$(smart -t "$TEST_KIND" -d "$type" "$dev" | grep -ci 'test has begun\|testing has begun' || true)"
+        if [ "${started_ok:-0}" -gt 0 ]; then
             ok "$dev: $TEST_KIND self test started"
             started=$((started + 1))
         else
