@@ -66,11 +66,11 @@ OK_STREAK="${OK_STREAK:-2}"
 PUBLIC_IP_EVERY="${PUBLIC_IP_EVERY:-15}"
 PUBLIC_IP_URL="${PUBLIC_IP_URL:-https://api.ipify.org}"
 BUSY_KB_S="${BUSY_KB_S:-200}"
-# Big enough that it does not finish before the measurement window, and fetched
-# in parallel because one stream rarely fills a modern link.
-BLOAT_URL="${BLOAT_URL:-http://speedtest.tele2.net/100MB.zip}"
+# Anycast, so it is served from a nearby edge rather than across the planet.
+# A distant file measures the distance, not your link.
+BLOAT_URL="${BLOAT_URL:-https://speed.cloudflare.com/__down?bytes=104857600}"
 BLOAT_STREAMS="${BLOAT_STREAMS:-4}"
-BLOAT_MIN_KB_S="${BLOAT_MIN_KB_S:-1000}"
+BLOAT_MIN_KB_S="${BLOAT_MIN_KB_S:-}"
 REPORT_DAYS="${REPORT_DAYS:-7}"
 
 MODE=report
@@ -412,8 +412,16 @@ do_bloat() {
     [ -n "$loaded" ] || die "lost the anchor while loaded, which is itself a bad sign"
 
     # A result measured on an unsaturated link is meaningless, so say so
-    # rather than reporting a flattering grade.
+    # rather than reporting a flattering grade. Judge against the most recent
+    # measured capacity when there is one, since a fixed floor cannot know
+    # whether 1 MB/s is this link at full stretch or barely trying.
     kbps=$(((rx2 - rx1) / 4 / 1024))
+    local floor="$BLOAT_MIN_KB_S"
+    if [ -z "$floor" ] && [ -s "$STATE/throughput.csv" ]; then
+        floor="$(awk -F, 'END { printf "%d", $2 / 8 / 1024 * 0.7 }' "$STATE/throughput.csv")"
+    fi
+    [ -n "$floor" ] && [ "$floor" -gt 0 ] || floor=500
+
     delta="$(awk -v a="$idle" -v b="$loaded" 'BEGIN { d = b - a; printf "%.0f", (d < 0 ? 0 : d) }')"
     grade="$(awk -v d="$delta" 'BEGIN {
         if (d < 5) print "A+"
@@ -423,7 +431,7 @@ do_bloat() {
         else if (d < 400) print "D"
         else print "F"
     }')"
-    [ "$kbps" -lt "$BLOAT_MIN_KB_S" ] && grade="$grade (unreliable)"
+    [ "$kbps" -lt "$floor" ] && grade="$grade (unreliable)"
 
     if [ "$AS_JSON" -eq 1 ]; then
         printf '{"idle_ms":%s,"loaded_ms":%s,"increase_ms":%s,"grade":"%s","load_kb_s":%s}\n' \
@@ -435,8 +443,8 @@ do_bloat() {
         kv "Increase" "+${delta} ms"
         kv "Load achieved" "$(human_bytes $((kbps * 1024)))/s"
         kv "Grade" "$grade"
-        if [ "$kbps" -lt "$BLOAT_MIN_KB_S" ]; then
-            warn "the link never saturated, so this grade means little; raise BLOAT_STREAMS or use a nearer file"
+        if [ "$kbps" -lt "$floor" ]; then
+            warn "the link never saturated (needed ${floor} KB/s), so this grade means little; raise BLOAT_STREAMS"
         fi
     fi
     csv_append "$STATE/bufferbloat.csv" 'ts,idle_ms,loaded_ms,delta_ms,grade,load_kb_s' \
