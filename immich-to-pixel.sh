@@ -242,24 +242,24 @@ declare -a ADB=()
 # queue being read by the transfer loop.
 transport_connect() {
     if [ -z "$PIXEL_ADDR" ]; then
-        PIXEL_ADDR="$(adb mdns services 2>/dev/null </dev/null |
+        PIXEL_ADDR="$(adb mdns services 2>/dev/null 9>&- </dev/null |
             awk '/_adb-tls-connect/ { print $3; exit }')"
         [ -n "$PIXEL_ADDR" ] ||
             die "no PIXEL_ADDR set and mDNS discovery found no adb-tls-connect service"
         info "discovered device at $PIXEL_ADDR"
     fi
 
-    adb connect "$PIXEL_ADDR" >/dev/null 2>&1 </dev/null || true
+    adb connect "$PIXEL_ADDR" >/dev/null 2>&1 9>&- </dev/null || true
     ADB=(adb -s "$PIXEL_ADDR")
 
     local state
-    state="$("${ADB[@]}" get-state 2>/dev/null </dev/null || true)"
+    state="$("${ADB[@]}" get-state 2>/dev/null 9>&- </dev/null || true)"
     [ "$state" = "device" ] ||
         die "device $PIXEL_ADDR is not available (state: ${state:-offline}). Re-pair wireless debugging, or run 'adb -d tcpip 5555' over USB to pin the port."
 }
 
 transport_push() {
-    "${ADB[@]}" push "$1" "$REMOTE_DIR/$2" >/dev/null </dev/null
+    "${ADB[@]}" push "$1" "$REMOTE_DIR/$2" >/dev/null 9>&- </dev/null
 }
 
 # Scan a batch of files in one adb round trip. The device-side loop echoes one
@@ -273,22 +273,22 @@ transport_scan_batch() {
     cmd="$cmd; do content call --uri content://media --method scan_file"
     cmd="$cmd --arg \$f >/dev/null 2>&1 && echo Y || echo N; done"
 
-    "${ADB[@]}" shell "$cmd" 2>/dev/null </dev/null | tr -d '\r'
+    "${ADB[@]}" shell "$cmd" 2>/dev/null 9>&- </dev/null | tr -d '\r'
 }
 
 transport_scan_volume() {
     "${ADB[@]}" shell content call --uri content://media \
-        --method scan_volume --arg external_primary >/dev/null 2>&1 </dev/null
+        --method scan_volume --arg external_primary >/dev/null 2>&1 9>&- </dev/null
 }
 
 # Available space on the shared volume, in KiB. Empty if unparseable.
 transport_free_kb() {
-    "${ADB[@]}" shell df -k "$REMOTE_DIR" 2>/dev/null </dev/null |
+    "${ADB[@]}" shell df -k "$REMOTE_DIR" 2>/dev/null 9>&- </dev/null |
         awk 'NR==2 && $4 ~ /^[0-9]+$/ { print $4 }'
 }
 
 transport_list_oldest_first() {
-    "${ADB[@]}" shell ls -t "$REMOTE_DIR" 2>/dev/null </dev/null |
+    "${ADB[@]}" shell ls -t "$REMOTE_DIR" 2>/dev/null 9>&- </dev/null |
         tr -d '\r' | sed '/^$/d' |
         awk '{ line[NR] = $0 } END { for (i = NR; i >= 1; i--) print line[i] }'
 }
@@ -296,7 +296,7 @@ transport_list_oldest_first() {
 transport_delete() {
     [ $# -gt 0 ] || return 0
     printf '%s\n' "$@" | sed "s|^|$REMOTE_DIR/|" |
-        xargs -n 40 "${ADB[@]}" shell rm -f >/dev/null 2>&1 || true
+        xargs -n 40 "${ADB[@]}" shell rm -f >/dev/null 2>&1 9>&- || true
 }
 
 # ------------------------------------------------------------
@@ -349,7 +349,7 @@ prune_remote() {
 
     write_protect_file
 
-    "${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null </dev/null |
+    "${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null 9>&- </dev/null |
         tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d' >"$raw" || true
 
     local -a stale=()
@@ -488,7 +488,7 @@ awk -F'\t' -v pushed="$PUSHED_FILE" '
 transport_connect
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 </dev/null ||
+    "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 9>&- </dev/null ||
         die "could not create $REMOTE_DIR on the device"
 fi
 
