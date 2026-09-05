@@ -67,9 +67,11 @@ PUBLIC_IP_EVERY="${PUBLIC_IP_EVERY:-15}"
 PUBLIC_IP_URL="${PUBLIC_IP_URL:-https://api.ipify.org}"
 BUSY_KB_S="${BUSY_KB_S:-200}"
 # Anycast, so it is served from a nearby edge rather than across the planet.
-# A distant file measures the distance, not your link.
-BLOAT_URL="${BLOAT_URL:-https://speed.cloudflare.com/__down?bytes=104857600}"
+# A distant file measures the distance, not your link. Cloudflare refuses
+# requests above roughly 50MB, so the load is looped rather than made larger.
+BLOAT_URL="${BLOAT_URL:-https://speed.cloudflare.com/__down?bytes=52428800}"
 BLOAT_STREAMS="${BLOAT_STREAMS:-4}"
+BLOAT_SECONDS="${BLOAT_SECONDS:-12}"
 BLOAT_MIN_KB_S="${BLOAT_MIN_KB_S:-}"
 REPORT_DAYS="${REPORT_DAYS:-7}"
 
@@ -344,7 +346,7 @@ link_busy_kb_s() {
 }
 
 do_full() {
-    require_tools speedtest
+    require_tools speedtest jq
     local busy
     busy="$(link_busy_kb_s)"
     if [ "$busy" -gt "$BUSY_KB_S" ]; then
@@ -358,10 +360,13 @@ do_full() {
     json="$(speedtest --json 2>/dev/null || true)"
     [ -n "$json" ] || die "speedtest produced no output"
 
-    local down up png
-    down="$(printf '%s' "$json" | awk -F'[,:]' '/"download"/ { print $2; exit }')"
-    up="$(printf '%s' "$json" | awk -F'[,:]' '/"upload"/ { print $2; exit }')"
-    png="$(printf '%s' "$json" | awk -F'[,:]' '/"ping"/ { print $2; exit }')"
+    # Field splitting on colons breaks here: server URLs contain them and
+    # "ping" appears both at the top level and inside the server object.
+    local down up png server
+    down="$(printf '%s' "$json" | jq -r '.download // 0')"
+    up="$(printf '%s' "$json" | jq -r '.upload // 0')"
+    png="$(printf '%s' "$json" | jq -r '.ping // 0')"
+    server="$(printf '%s' "$json" | jq -r '(.server.name // "?") + ", " + (.server.sponsor // "?")')"
 
     csv_append "$STATE/throughput.csv" 'ts,down_bps,up_bps,ping_ms' \
         "$NOW,${down:-0},${up:-0},${png:-0}"
@@ -374,6 +379,10 @@ do_full() {
         kv "Download" "$(awk -v v="${down:-0}" 'BEGIN { printf "%.1f Mbps", v / 1000000 }')"
         kv "Upload" "$(awk -v v="${up:-0}" 'BEGIN { printf "%.1f Mbps", v / 1000000 }')"
         kv "Idle ping" "$(awk -v v="${png:-0}" 'BEGIN { printf "%.0f ms", v }')"
+        kv "Server" "$server"
+        if awk -v v="${png:-0}" 'BEGIN { exit !(v > 80) }'; then
+            warn "that server is ${png%.*}ms away, so the throughput figure understates your link"
+        fi
     fi
 }
 
@@ -386,27 +395,42 @@ do_full() {
 
 do_bloat() {
     require_tools curl
-    local anchor idle loaded delta grade iface rx1 rx2 kbps i
+    local anchor idle loaded delta grade iface rx1 rx2 kbps i code deadline
     local -a pids=()
     anchor="$(printf '%s' "$ANCHORS" | awk '{ print $1 }')"
     iface="$(ip route 2>/dev/null | awk '/^default/ { for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit }')"
+
+    # A load generator that 403s produces a flawless grade and no load at all.
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -r 0-1024 "$BLOAT_URL" 2>/dev/null || echo 000)"
+    case "$code" in
+        2* | 3*) ;;
+        *) die "load source returned HTTP $code: $BLOAT_URL" ;;
+    esac
 
     info "measuring idle latency..."
     idle="$(ping_stats "$anchor" 10 | awk '{ print $2 }')"
     [ -n "$idle" ] || die "cannot reach $anchor"
 
-    info "saturating the link with $BLOAT_STREAMS streams..."
+    info "saturating the link with $BLOAT_STREAMS streams for ${BLOAT_SECONDS}s..."
+    deadline=$(($(date +%s) + BLOAT_SECONDS))
     for i in $(seq 1 "$BLOAT_STREAMS"); do
-        curl -s -o /dev/null --max-time 40 "$BLOAT_URL" &
+        (
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+                curl -s -o /dev/null --max-time 15 "$BLOAT_URL" || true
+            done
+        ) &
         pids+=($!)
     done
-    sleep 3
+    sleep 2
 
     rx1="$(awk -v i="$iface:" '$1 == i { print $2 }' /proc/net/dev)"
     loaded="$(ping_stats "$anchor" 20 | awk '{ print $2 }')"
     rx2="$(awk -v i="$iface:" '$1 == i { print $2 }' /proc/net/dev)"
 
-    for i in "${pids[@]}"; do kill "$i" 2>/dev/null || true; done
+    for i in "${pids[@]}"; do
+        pkill -P "$i" 2>/dev/null || true
+        kill "$i" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
 
     [ -n "$loaded" ] || die "lost the anchor while loaded, which is itself a bad sign"
