@@ -18,3 +18,11 @@ USB_RESET_WARN=5
 # SMART normalized values count down from 100 toward the failure threshold, so
 # this is roughly "percent of rated load cycles remaining".
 LOAD_CYCLE_NORM_WARN=20
+
+# How long to keep per-attribute history, used to derive wear rates and to
+# project when a drive reaches the end of its rated life.
+HISTORY_DAYS=90
+
+# Minimum history span before a rate is reported. Head parking is bursty and
+# workload dependent, so a short window reports either zero or nonsense.
+MIN_RATE_HOURS=6

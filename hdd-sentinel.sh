@@ -62,6 +62,9 @@ TEMP_CRIT="${TEMP_CRIT:-55}"
 USB_RESET_WARN="${USB_RESET_WARN:-5}"
 # SMART normalized values count down from 100 toward the failure threshold.
 LOAD_CYCLE_NORM_WARN="${LOAD_CYCLE_NORM_WARN:-20}"
+HISTORY_DAYS="${HISTORY_DAYS:-90}"
+# Short windows measure noise: head parking is bursty and tied to workload.
+MIN_RATE_HOURS="${MIN_RATE_HOURS:-6}"
 
 QUIET=0
 AS_JSON=0
@@ -295,6 +298,48 @@ attr_norm() {
         [(.ata_smart_attributes.table // [])[] | select(.id == $id) | .value] | first // empty'
 }
 
+# record_history <key> <current_attrs_file>
+record_history() {
+    local key="$1" cur="$2"
+    local hist="$STATE/history-$key.tsv" now cutoff
+    now="$(date +%s)"
+    awk -F"$TAB" -v ts="$now" '{ print ts "\t" $1 "\t" $2 }' "$cur" >>"$hist"
+    cutoff=$((now - HISTORY_DAYS * 86400))
+    awk -F"$TAB" -v c="$cutoff" '$1 >= c' "$hist" >"$hist.tmp" && mv "$hist.tmp" "$hist"
+}
+
+# attr_rate <key> <id> -> "per_hour span_hours", empty until the history spans
+# MIN_RATE_HOURS. Counters like load cycles accrue in bursts, so a short window
+# reports either zero or a wildly inflated rate.
+attr_rate() {
+    local key="$1" id="$2"
+    local hist="$STATE/history-$key.tsv"
+    [ -f "$hist" ] || return 1
+    awk -F"$TAB" -v id="$id" -v minh="$MIN_RATE_HOURS" '
+        $2 == id {
+            if (ft == "") { first = $3; ft = $1 }
+            last = $3; lt = $1
+        }
+        END {
+            if (ft == "" || lt <= ft) exit 1
+            span = (lt - ft) / 3600
+            if (span < minh) exit 1
+            printf "%.1f %.1f", (last - first) / span, span
+        }' "$hist"
+}
+
+# project_days <raw> <normalized> <per_hour> - when the normalized value hits 0.
+# The drive scales raw to normalized linearly, so the current pair reveals the
+# full-life raw count without needing the datasheet.
+project_days() {
+    awk -v raw="$1" -v norm="$2" -v rate="$3" 'BEGIN {
+        if (norm >= 100 || norm < 0 || rate <= 0) { print -1; exit }
+        remaining = (raw / (100 - norm)) * 100 - raw
+        if (remaining <= 0) { print 0; exit }
+        printf "%.0f", remaining / (rate * 24)
+    }'
+}
+
 WORST=0
 
 while IFS="$TAB" read -r dev type; do
@@ -312,8 +357,8 @@ while IFS="$TAB" read -r dev type; do
     }
 
     if printf '%s' "$json" | jq -e '.smartctl.messages[]?.string | select(test("STANDBY"; "i"))' >/dev/null 2>&1; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$dev" "standby" "-" "-" "-" "-" "-" "-" "asleep, not woken" >>"$ROWS"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$dev" "standby" "-" "-" "-" "-" "-" "-" "-" "-" "asleep, not woken" >>"$ROWS"
         continue
     fi
 
@@ -371,6 +416,7 @@ while IFS="$TAB" read -r dev type; do
     fi
 
     cp "$cur" "$snap"
+    record_history "$key" "$cur"
 
     lcc="$(awk -F"$TAB" '$1 == 193 { print $2; exit }' "$cur")"
     lcc_norm="$(attr_norm "$json" 193)"
@@ -380,14 +426,27 @@ while IFS="$TAB" read -r dev type; do
         [ "$WORST" -lt 1 ] && WORST=1
     fi
 
+    lcc_rate='-'
+    lcc_proj='-'
+    if rate_pair="$(attr_rate "$key" 193)"; then
+        lcc_rate="${rate_pair%% *}"
+        if [ -n "$lcc_norm" ] && [ "$lcc_norm" != null ]; then
+            lcc_proj="$(project_days "$lcc" "$lcc_norm" "$lcc_rate")"
+            if [ "$lcc_proj" -gt 0 ] 2>/dev/null; then
+                dev_notes="${dev_notes:+$dev_notes; }+${lcc_rate}/h, rated life ends in ~${lcc_proj}d"
+            fi
+        fi
+    fi
+
     case "$level" in
         crit) WORST=2 ;;
         warn) [ "$WORST" -lt 1 ] && WORST=1 ;;
     esac
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$dev" "$level" "$model" "$serial" "${temp:--}" "${hours:--}" \
-        "${lcc:--}${lcc_norm:+ (${lcc_norm}%)}" "$(printf '%s' "$passed" | tr -d ' ')" "${dev_notes:--}" >>"$ROWS"
+        "${lcc:--}${lcc_norm:+ (${lcc_norm}%)}" "$(printf '%s' "$passed" | tr -d ' ')" \
+        "$lcc_rate" "$lcc_proj" "${dev_notes:--}" >>"$ROWS"
 done <<EOF
 $(discover)
 EOF
@@ -481,7 +540,8 @@ if [ "$AS_JSON" -eq 1 ]; then
             first = 0
             printf "\n    {\"device\":\"%s\",\"level\":\"%s\",\"model\":\"%s\",\"serial\":\"%s\",", $1, $2, $3, $4
             printf "\"temp_c\":\"%s\",\"power_on_hours\":\"%s\",\"load_cycles\":\"%s\",", $5, $6, $7
-            printf "\"smart_passed\":\"%s\",\"notes\":\"%s\"}", $8, $9
+            printf "\"smart_passed\":\"%s\",\"load_cycles_per_hour\":\"%s\",", $8, $9
+            printf "\"rated_life_days_left\":\"%s\",\"notes\":\"%s\"}", $10, $11
         }
         END {
             printf "\n  ],\n"
@@ -498,7 +558,7 @@ if [ "$QUIET" -eq 0 ] || [ "$WORST" -gt 0 ]; then
     section "Disk health"
     printf '%-10s %-6s %-20s %5s %8s %14s  %s\n' \
         DEVICE STATE MODEL TEMP HOURS 'LOAD-CYC' NOTES
-    while IFS="$TAB" read -r dev level model serial temp hours lcc passed notes; do
+    while IFS="$TAB" read -r dev level model serial temp hours lcc passed lcc_rate lcc_proj notes; do
         case "$level" in
             crit) color="$RED" ;;
             warn) color="$YELLOW" ;;
@@ -525,10 +585,10 @@ fi
 
 if [ "$WORST" -eq 2 ]; then
     notify_dedupe hdd-crit 21600 crit "hdd-sentinel: critical disk finding" \
-        "$(awk -F"$TAB" '$2 == "crit" { print $1 ": " $9 }' "$ROWS")"
+        "$(awk -F"$TAB" '$2 == "crit" { print $1 ": " $11 }' "$ROWS")"
 elif [ "$WORST" -eq 1 ]; then
     notify_dedupe hdd-warn 86400 warn "hdd-sentinel: disk warning" \
-        "$(awk -F"$TAB" '$2 == "warn" { print $1 ": " $9 }' "$ROWS")"
+        "$(awk -F"$TAB" '$2 == "warn" { print $1 ": " $11 }' "$ROWS")"
 fi
 
 exit "$WORST"
