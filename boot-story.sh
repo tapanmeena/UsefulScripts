@@ -176,14 +176,10 @@ fi
 fs_recovery="$(jrn -b 0 --no-pager -k | grep -iE 'EXT4-fs \(.*\): (recovery complete|orphan cleanup)' || true)"
 if [ -n "$fs_recovery" ]; then
     HAS_FS_RECOVERY=1
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        dev="$(printf '%s' "$line" | sed -n 's/.*EXT4-fs (\([^)]*\)).*/\1/p')"
-        kind="$(printf '%s' "$line" | grep -oiE 'recovery complete|orphan cleanup')"
-        note warn "filesystem $dev needed $kind at mount, which only happens after an unclean stop"
-    done <<EOF
-$fs_recovery
-EOF
+    fs_devs="$(printf '%s\n' "$fs_recovery" |
+        sed -n 's/.*EXT4-fs (\([^)]*\)).*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+    fs_count="$(printf '%s' "$fs_devs" | wc -w | tr -d ' ')"
+    note warn "$fs_count filesystem(s) needed recovery at mount ($fs_devs), which only happens after an unclean stop"
 fi
 
 data_loss="$(jrn -b 0 --no-pager -k | grep -icE 'potential data loss|failed to convert unwritten extents' || true)"
@@ -231,9 +227,11 @@ fi
 
 # --- current state -------------------------------------------------------
 
-failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{ print $1 }' | grep -c . || true)"
+# --plain drops the leading bullet glyph, which would otherwise become the unit name.
+failed_units="$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null | awk '{ printf "%s ", $1 }' | sed 's/ *$//')"
+failed="$(printf '%s' "$failed_units" | wc -w | tr -d ' ')"
 if [ "$failed" -gt 0 ]; then
-    note warn "$failed unit(s) failed to start: $(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{ printf "%s ", $1 }')"
+    note warn "$failed unit(s) failed to start: $failed_units"
 fi
 
 # ------------------------------------------------------------
@@ -262,6 +260,12 @@ elif [ "$HAS_THERMAL" -eq 1 ]; then
 elif [ "$CLEAN_SHUTDOWN" = no ] && { [ "$HAS_UNDERVOLT" -eq 1 ] || [ "$HAS_OVERCURRENT" -eq 1 ]; }; then
     VERDICT='POWER LOSS'
     CONFIDENCE=high
+    SUGGESTION='Move bus-powered disks onto a powered USB hub, or fit a larger supply'
+elif [ "$HAS_FS_RECOVERY" -eq 1 ] && { [ "$HAS_UNDERVOLT" -eq 1 ] || [ "$HAS_OVERCURRENT" -eq 1 ]; }; then
+    # No previous journal to confirm it, but an unclean stop alongside power
+    # faults points the same way.
+    VERDICT='POWER LOSS'
+    CONFIDENCE=medium
     SUGGESTION='Move bus-powered disks onto a powered USB hub, or fit a larger supply'
 elif [ "$CLEAN_SHUTDOWN" = no ]; then
     VERDICT='UNCLEAN STOP'
