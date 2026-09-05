@@ -232,14 +232,36 @@ io_error_count() {
         grep -ciE 'I/O error|EXT4-fs error|critical medium error' || true
 }
 
-# Devices the kernel has complained about that no longer exist mean an
-# enclosure re-enumerated under a different letter.
-renamed_devices() {
-    local seen present
-    seen="$({ dmesg 2>/dev/null || true; } |
-        grep -oE '\b(sd[a-z])[0-9]*\b' | sed 's/[0-9]*$//' | sort -u || true)"
-    present="$(lsblk -dpno NAME 2>/dev/null | sed 's|/dev/||' | sort -u || true)"
-    comm -23 <(printf '%s\n' "$seen" | sed '/^$/d') <(printf '%s\n' "$present" | sed '/^$/d') || true
+# A drive that keeps the same serial but changes device letter dropped off the
+# bus and came back. One that vanishes entirely was unplugged. Matching on
+# serials tells those apart; matching on letters in dmesg cannot.
+DEVMAP="$STATE/devices.tsv"
+
+detect_device_changes() {
+    local present="$1" ser dev old
+    if [ ! -f "$DEVMAP" ]; then
+        cp "$present" "$DEVMAP"
+        return 0
+    fi
+
+    while IFS="$TAB" read -r ser dev; do
+        [ -n "$ser" ] || continue
+        old="$(awk -F"$TAB" -v s="$ser" '$1 == s { print $2; exit }' "$DEVMAP")"
+        if [ -n "$old" ] && [ "$old" != "$dev" ]; then
+            printf 'bus: %s moved %s -> %s, so it dropped off the bus and re-enumerated\n' \
+                "$ser" "$old" "$dev" >>"$NOTES"
+            [ "$WORST" -lt 1 ] && WORST=1
+        fi
+    done <"$present"
+
+    while IFS="$TAB" read -r ser dev; do
+        [ -n "$ser" ] || continue
+        if ! awk -F"$TAB" -v s="$ser" '$1 == s { found = 1 } END { exit !found }' "$present"; then
+            printf 'bus: %s (was %s) is no longer attached\n' "$ser" "$dev" >>"$NOTES"
+        fi
+    done <"$DEVMAP"
+
+    cp "$present" "$DEVMAP"
 }
 
 # ------------------------------------------------------------
@@ -279,6 +301,8 @@ ROWS="$WORK_DIR/rows.tsv"
 : >"$ROWS"
 NOTES="$WORK_DIR/notes.txt"
 : >"$NOTES"
+PRESENT="$WORK_DIR/present.tsv"
+: >"$PRESENT"
 
 # The five Backblaze found actually predict failure, plus load cycles, which
 # USB enclosures burn through by parking heads aggressively.
@@ -370,6 +394,7 @@ while IFS="$TAB" read -r dev type; do
 
     key="$(printf '%s' "$serial" | tr -c 'A-Za-z0-9._-' '_')"
     snap="$STATE/attrs-$key.tsv"
+    printf '%s\t%s\n' "$serial" "$dev" >>"$PRESENT"
 
     dev_notes=''
     level=ok
@@ -521,11 +546,7 @@ if [ "$FIRST_RUN" -eq 1 ] && { [ "$RESETS" -gt 0 ] || [ "$IOERRS" -gt 0 ]; }; th
         "$RESETS" "$IOERRS" >>"$NOTES"
 fi
 
-GONE="$(renamed_devices | tr '\n' ' ' | sed 's/ *$//')"
-if [ -n "$GONE" ]; then
-    printf 'bus: kernel logged %s but it is not present now, so an enclosure re-enumerated\n' "$GONE" >>"$NOTES"
-    [ "$WORST" -lt 1 ] && WORST=1
-fi
+detect_device_changes "$PRESENT"
 
 # ------------------------------------------------------------
 # OUTPUT
