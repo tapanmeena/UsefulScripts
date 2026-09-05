@@ -434,14 +434,23 @@ timer_status() {
             echo "-"
         fi
     else
-        if systemctl --user list-timers --all 2>/dev/null | grep -q "$name.timer"; then
-            systemctl --user list-timers --all 2>/dev/null |
-                awk -v n="$name.timer" '$0 ~ n { print "next " $1 " " $2 }' | head -1
-        elif [ -f "$CONFIG_HOME/systemd/user/$name.timer" ]; then
-            echo "unit present, not enabled"
-        else
-            echo "-"
-        fi
+        # Query the unit rather than grepping list-timers, whose columns get
+        # truncated to the terminal width and hide the longer unit names.
+        local enabled next
+        enabled="$(systemctl --user is-enabled "$name.timer" 2>/dev/null || true)"
+        case "$enabled" in
+            '') echo "-" ;;
+            enabled)
+                next="$(systemctl --user show "$name.timer" \
+                    -p NextElapseUSecRealtime --value 2>/dev/null || true)"
+                if [ -n "$next" ] && [ "$next" != 0 ]; then
+                    echo "next ${next% *}"
+                else
+                    echo "enabled"
+                fi
+                ;;
+            *) echo "$enabled" ;;
+        esac
     fi
 }
 
