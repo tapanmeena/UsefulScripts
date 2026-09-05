@@ -12,11 +12,16 @@
 # to 8 is an emergency; one that has sat at 8 for two years is not. Alerting on
 # absolute thresholds is why people learn to ignore SMART.
 #
-# It also tracks two things SMART is blind to, which matter because USB drives
-# usually fail at the bridge or the cable rather than the platter:
+# It also tracks three things SMART is blind to, which matter because USB disks
+# usually fail at the power rail or the bridge rather than the platter:
 #
+#   * USB over-current events, where the controller cut power mid-transfer
 #   * USB reset and I/O error counts from the kernel ring buffer
 #   * device letter reassignment, which means an enclosure dropped off the bus
+#
+# Over-current is normally the cause and the other two are its symptoms. When
+# every port reports it at once the rail itself collapsed, which means the bus
+# cannot supply the attached disks and no cable or disk swap will help.
 #
 # Reads are done with `-n standby` so polling never spins up a sleeping disk.
 # Waking a drive every hour to ask whether it is healthy causes the wear it is
@@ -212,6 +217,13 @@ usb_reset_count() {
         grep -ciE 'reset (high|super|full)-speed USB device' || true
 }
 
+# The controller reports one line per port, so a single rail collapse looks
+# like six events. Counting distinct "change #N" values gives incidents.
+over_current_count() {
+    { dmesg 2>/dev/null || true; } |
+        grep -oiE 'over-?current change #[0-9]+' | sort -u | grep -c . || true
+}
+
 io_error_count() {
     { dmesg 2>/dev/null || true; } |
         grep -ciE 'I/O error|EXT4-fs error|critical medium error' || true
@@ -387,29 +399,54 @@ EOF
 
 RESETS="$(usb_reset_count)"
 IOERRS="$(io_error_count)"
+OVERCUR="$(over_current_count)"
 KERNEL_SNAP="$STATE/kernel.tsv"
 FIRST_RUN=0
 PREV_RESETS=0
 PREV_IOERRS=0
+PREV_OVERCUR=0
 if [ -f "$KERNEL_SNAP" ]; then
     PREV_RESETS="$(awk -F"$TAB" '$1 == "resets" { print $2; exit }' "$KERNEL_SNAP")"
     PREV_IOERRS="$(awk -F"$TAB" '$1 == "ioerrors" { print $2; exit }' "$KERNEL_SNAP")"
+    PREV_OVERCUR="$(awk -F"$TAB" '$1 == "overcurrent" { print $2; exit }' "$KERNEL_SNAP")"
     : "${PREV_RESETS:=0}" "${PREV_IOERRS:=0}"
+    # A snapshot written before over-current tracking existed has no such key.
+    # Treat that as a baseline, not as a burst of brand new events.
+    [ -n "$PREV_OVERCUR" ] || PREV_OVERCUR="$OVERCUR"
 else
     # Everything already in the ring buffer is history, not news. Baseline it
     # instead of alerting on months of old entries the first time we look.
     FIRST_RUN=1
     PREV_RESETS="$RESETS"
     PREV_IOERRS="$IOERRS"
+    PREV_OVERCUR="$OVERCUR"
 fi
-printf 'resets\t%s\nioerrors\t%s\n' "$RESETS" "$IOERRS" >"$KERNEL_SNAP"
+printf 'resets\t%s\nioerrors\t%s\novercurrent\t%s\n' "$RESETS" "$IOERRS" "$OVERCUR" >"$KERNEL_SNAP"
 
 # dmesg is a ring buffer, so a smaller count means it wrapped, not that errors
 # were undone.
 RESET_DELTA=$((RESETS - PREV_RESETS))
 IOERR_DELTA=$((IOERRS - PREV_IOERRS))
+OVERCUR_DELTA=$((OVERCUR - PREV_OVERCUR))
 [ "$RESET_DELTA" -lt 0 ] && RESET_DELTA=0
 [ "$IOERR_DELTA" -lt 0 ] && IOERR_DELTA=0
+[ "$OVERCUR_DELTA" -lt 0 ] && OVERCUR_DELTA=0
+
+# Over-current is the cause; resets, renames and I/O errors are its symptoms.
+# dmesg only covers the current boot, so any hit here is recent enough to act
+# on and is reported whether or not it changed.
+if [ "$OVERCUR" -gt 0 ]; then
+    if [ "$OVERCUR_DELTA" -gt 0 ]; then
+        printf 'power: %d NEW USB over-current event(s); the port cut power mid-transfer\n' \
+            "$OVERCUR_DELTA" >>"$NOTES"
+        WORST=2
+    else
+        printf 'power: %d USB over-current event(s) this boot; the bus cannot supply these drives\n' \
+            "$OVERCUR" >>"$NOTES"
+        [ "$WORST" -lt 1 ] && WORST=1
+    fi
+    printf 'power: a powered USB hub is the fix; cables and disks are not the fault here\n' >>"$NOTES"
+fi
 
 if [ "$RESET_DELTA" -ge "$USB_RESET_WARN" ]; then
     printf 'usb: %d new bus resets since the last run\n' "$RESET_DELTA" >>"$NOTES"
@@ -435,7 +472,8 @@ fi
 # ------------------------------------------------------------
 
 if [ "$AS_JSON" -eq 1 ]; then
-    awk -F"$TAB" -v resets="$RESETS" -v rd="$RESET_DELTA" -v ioerr="$IOERRS" -v iod="$IOERR_DELTA" '
+    awk -F"$TAB" -v resets="$RESETS" -v rd="$RESET_DELTA" -v ioerr="$IOERRS" -v iod="$IOERR_DELTA" \
+        -v oc="$OVERCUR" -v ocd="$OVERCUR_DELTA" '
         BEGIN { print "{"; printf "  \"disks\": ["; first = 1 }
         {
             if (!first) printf ","
@@ -447,6 +485,7 @@ if [ "$AS_JSON" -eq 1 ]; then
         END {
             printf "\n  ],\n"
             printf "  \"usb_resets\": %d, \"usb_resets_new\": %d,\n", resets, rd
+            printf "  \"usb_over_current\": %d, \"usb_over_current_new\": %d,\n", oc, ocd
             printf "  \"io_errors\": %d, \"io_errors_new\": %d\n", ioerr, iod
             print "}"
         }
@@ -477,8 +516,8 @@ if [ "$QUIET" -eq 0 ] || [ "$WORST" -gt 0 ]; then
     fi
 
     printf '\n'
-    printf '%bUSB bus resets: %s total, %s new. I/O errors: %s total, %s new.%b\n' \
-        "$DIM" "$RESETS" "$RESET_DELTA" "$IOERRS" "$IOERR_DELTA" "$NC"
+    printf '%bUSB over-current: %s this boot, %s new. Bus resets: %s total, %s new. I/O errors: %s total, %s new.%b\n' \
+        "$DIM" "$OVERCUR" "$OVERCUR_DELTA" "$RESETS" "$RESET_DELTA" "$IOERRS" "$IOERR_DELTA" "$NC"
     printf '%bAlerts fire on change, not on a non-zero value that has been stable.%b\n' \
         "$DIM" "$NC"
 fi
