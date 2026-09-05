@@ -66,7 +66,11 @@ OK_STREAK="${OK_STREAK:-2}"
 PUBLIC_IP_EVERY="${PUBLIC_IP_EVERY:-15}"
 PUBLIC_IP_URL="${PUBLIC_IP_URL:-https://api.ipify.org}"
 BUSY_KB_S="${BUSY_KB_S:-200}"
-BLOAT_URL="${BLOAT_URL:-http://speedtest.tele2.net/10MB.zip}"
+# Big enough that it does not finish before the measurement window, and fetched
+# in parallel because one stream rarely fills a modern link.
+BLOAT_URL="${BLOAT_URL:-http://speedtest.tele2.net/100MB.zip}"
+BLOAT_STREAMS="${BLOAT_STREAMS:-4}"
+BLOAT_MIN_KB_S="${BLOAT_MIN_KB_S:-1000}"
 REPORT_DAYS="${REPORT_DAYS:-7}"
 
 MODE=report
@@ -382,24 +386,35 @@ do_full() {
 
 do_bloat() {
     require_tools curl
-    local anchor idle loaded delta grade pid
+    local anchor idle loaded delta grade iface rx1 rx2 kbps i
+    local -a pids=()
     anchor="$(printf '%s' "$ANCHORS" | awk '{ print $1 }')"
+    iface="$(ip route 2>/dev/null | awk '/^default/ { for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit }')"
 
     info "measuring idle latency..."
     idle="$(ping_stats "$anchor" 10 | awk '{ print $2 }')"
     [ -n "$idle" ] || die "cannot reach $anchor"
 
-    info "saturating the link..."
-    curl -s -o /dev/null --max-time 25 "$BLOAT_URL" &
-    pid=$!
+    info "saturating the link with $BLOAT_STREAMS streams..."
+    for i in $(seq 1 "$BLOAT_STREAMS"); do
+        curl -s -o /dev/null --max-time 40 "$BLOAT_URL" &
+        pids+=($!)
+    done
     sleep 3
-    loaded="$(ping_stats "$anchor" 15 | awk '{ print $2 }')"
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+
+    rx1="$(awk -v i="$iface:" '$1 == i { print $2 }' /proc/net/dev)"
+    loaded="$(ping_stats "$anchor" 20 | awk '{ print $2 }')"
+    rx2="$(awk -v i="$iface:" '$1 == i { print $2 }' /proc/net/dev)"
+
+    for i in "${pids[@]}"; do kill "$i" 2>/dev/null || true; done
+    wait 2>/dev/null || true
 
     [ -n "$loaded" ] || die "lost the anchor while loaded, which is itself a bad sign"
 
-    delta="$(awk -v a="$idle" -v b="$loaded" 'BEGIN { printf "%.0f", b - a }')"
+    # A result measured on an unsaturated link is meaningless, so say so
+    # rather than reporting a flattering grade.
+    kbps=$(((rx2 - rx1) / 4 / 1024))
+    delta="$(awk -v a="$idle" -v b="$loaded" 'BEGIN { d = b - a; printf "%.0f", (d < 0 ? 0 : d) }')"
     grade="$(awk -v d="$delta" 'BEGIN {
         if (d < 5) print "A+"
         else if (d < 30) print "A"
@@ -408,19 +423,24 @@ do_bloat() {
         else if (d < 400) print "D"
         else print "F"
     }')"
+    [ "$kbps" -lt "$BLOAT_MIN_KB_S" ] && grade="$grade (unreliable)"
 
     if [ "$AS_JSON" -eq 1 ]; then
-        printf '{"idle_ms":%s,"loaded_ms":%s,"increase_ms":%s,"grade":"%s"}\n' \
-            "$idle" "$loaded" "$delta" "$grade"
+        printf '{"idle_ms":%s,"loaded_ms":%s,"increase_ms":%s,"grade":"%s","load_kb_s":%s}\n' \
+            "$idle" "$loaded" "$delta" "$grade" "$kbps"
     else
         section "Bufferbloat"
-        kv "Idle latency" "${idle} ms"
-        kv "Latency under load" "${loaded} ms"
+        kv "Idle latency" "$(awk -v v="$idle" 'BEGIN { printf "%.1f ms", v }')"
+        kv "Latency under load" "$(awk -v v="$loaded" 'BEGIN { printf "%.1f ms", v }')"
         kv "Increase" "+${delta} ms"
+        kv "Load achieved" "$(human_bytes $((kbps * 1024)))/s"
         kv "Grade" "$grade"
+        if [ "$kbps" -lt "$BLOAT_MIN_KB_S" ]; then
+            warn "the link never saturated, so this grade means little; raise BLOAT_STREAMS or use a nearer file"
+        fi
     fi
-    csv_append "$STATE/bufferbloat.csv" 'ts,idle_ms,loaded_ms,delta_ms,grade' \
-        "$NOW,$idle,$loaded,$delta,$grade"
+    csv_append "$STATE/bufferbloat.csv" 'ts,idle_ms,loaded_ms,delta_ms,grade,load_kb_s' \
+        "$NOW,$idle,$loaded,$delta,$grade,$kbps"
 }
 
 # ------------------------------------------------------------
@@ -446,7 +466,7 @@ do_report() {
     up_n="$(printf '%s\n' "$window" | awk -F, '$5 != "" { n++ } END { print n + 0 }')"
     uptime_pct="$(awk -v a="$up_n" -v b="$total" 'BEGIN { printf "%.2f", b ? a / b * 100 : 0 }')"
     avg_rtt="$(printf '%s\n' "$window" | awk -F, '$5 != "" { s += $5; n++ } END { printf "%.1f", n ? s / n : 0 }')"
-    max_rtt="$(printf '%s\n' "$window" | awk -F, '$5 != "" && $5 + 0 > m { m = $5 } END { printf "%.0f", m }')"
+    max_rtt="$(printf '%s\n' "$window" | awk -F, '$5 != "" && $5 + 0 > m { m = $5 } END { printf "%.1f", m }')"
     avg_loss="$(printf '%s\n' "$window" | awk -F, '{ s += $6; n++ } END { printf "%.2f", n ? s / n : 0 }')"
 
     if [ "$AS_JSON" -eq 1 ]; then
@@ -473,14 +493,17 @@ do_report() {
     fi
 
     # Same hour every day, which is where ISP congestion shows itself.
-    local tod
-    tod="$(printf '%s\n' "$window" | awk -F, '
-        $5 != "" { h = int(($1 % 86400) / 3600); s[h] += $5; n[h]++ }
+    # Bucketed in local time, since "every evening at nine" is the claim you
+    # want to be able to make.
+    local tod tz_off
+    tz_off="$(date +%z | awk '{ s = substr($0,1,1); h = substr($0,2,2); m = substr($0,4,2); v = h * 3600 + m * 60; print (s == "-" ? -v : v) }')"
+    tod="$(printf '%s\n' "$window" | awk -F, -v off="$tz_off" '
+        $5 != "" { h = int((($1 + off) % 86400) / 3600); s[h] += $5; n[h]++ }
         END { for (h = 0; h < 24; h++) printf "%.1f\n", (n[h] ? s[h] / n[h] : 0) }')"
     if [ -n "$tod" ]; then
         # shellcheck disable=SC2086  # deliberate word splitting into arguments
         printf '\n%bBy hour of day%b       %s\n' "$BLUE" "$NC" "$(sparkline $tod)"
-        printf '%b%s%b\n' "$DIM" "  00h                     12h                     23h (UTC)" "$NC"
+        printf '%b%s%b\n' "$DIM" "  00h                     12h                     23h (local)" "$NC"
     fi
 
     section "Worst 5 windows"
