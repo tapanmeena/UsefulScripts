@@ -550,7 +550,7 @@ if [ "$OVERCUR" -gt 0 ]; then
             "$OVERCUR" >>"$NOTES"
         [ "$WORST" -lt 1 ] && WORST=1
     fi
-    printf 'power: a powered USB hub is the fix; cables and disks are not the fault here\n' >>"$NOTES"
+    printf 'power: a powered USB hub addresses this; check attribute 199 separately for cable faults\n' >>"$NOTES"
 fi
 
 if [ "$RESET_DELTA" -ge "$USB_RESET_WARN" ]; then
