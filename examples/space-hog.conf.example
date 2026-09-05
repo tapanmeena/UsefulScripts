@@ -1,0 +1,10 @@
+# space-hog configuration
+#
+# Copied to ~/.config/space-hog.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Project directories to scan for build and dependency caches.
+ROOTS="$HOME/Desktop/Projects"
+
+# Categories smaller than this are folded into the total but not listed.
+MIN_REPORT_MB=50

@@ -1,0 +1,71 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          fail=0
+          for f in $(find . -name '*.sh' -not -path './.git/*'); do
+            bash -n "$f" || fail=1
+          done
+          exit $fail
+
+      - name: shellcheck
+        run: shellcheck -x -s bash lib/common.sh install.sh .github/*.sh
+
+      # These two predate the shared library. Their findings are the ones
+      # `section` and `kv` exist to fix, so they stay visible but non-blocking
+      # until the retrofit lands.
+      - name: shellcheck (awaiting retrofit)
+        continue-on-error: true
+        run: shellcheck -x -s bash immich-to-pixel.sh rpistats.sh
+
+      # Same story for formatting.
+      - name: shfmt
+        run: |
+          curl -fsSL -o /tmp/shfmt \
+            https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64
+          chmod +x /tmp/shfmt
+          /tmp/shfmt -d -i 4 -ci lib/ install.sh .github/bash32-lint.sh
+
+      - name: bash 3.2 compatibility
+        run: ./.github/bash32-lint.sh
+
+  # Catches parse-level bash 4 syntax that the grep pass can miss. Runtime-only
+  # constructs such as ${x,,} still need the grep pass above.
+  bash32-parse:
+    runs-on: ubuntu-latest
+    container: bash:3.2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse 3.2-safe scripts under bash 3.2
+        run: |
+          fail=0
+          for f in $(find . -name '*.sh' -not -path './.git/*'); do
+            grep -qi '3\.2 safe' "$f" || continue
+            echo "checking $f"
+            bash -n "$f" || fail=1
+          done
+          exit $fail
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: '**/*.md'

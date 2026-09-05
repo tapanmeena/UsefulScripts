@@ -1,0 +1,18 @@
+# repo-sweep configuration
+#
+# Copied to ~/.config/repo-sweep.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Directories to scan, space separated. Each is scanned one level deep, plus
+# any sibling <repo>.worktrees/ directories.
+ROOTS="$HOME/Desktop/Projects"
+
+# Parallel workers. Raise it if you have many repositories on fast storage.
+JOBS=8
+
+# Default cutoff for --stale, in days.
+STALE_DAYS=90
+
+# Untracked files at least this large are flagged, since committing one by
+# accident is hard to undo.
+BIG_FILE_MB=10

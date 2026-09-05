@@ -1,0 +1,5 @@
+# Let shellcheck follow `. lib/common.sh` without needing -x on the command line.
+external-sources=true
+
+# The repo targets bash, not sh.
+shell=bash
