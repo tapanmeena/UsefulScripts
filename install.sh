@@ -250,7 +250,13 @@ do_link() {
         target="$PREFIX/$name"
 
         if [ "$runs" != any ] && [ "$runs" != "$HOST_KIND" ]; then
-            kv "$name" "skipped (runs on $runs)"
+            # It may have been installed here before it was reclassified.
+            if [ -L "$target" ]; then
+                run rm -f "$target"
+                kv "$name" "unlinked (runs on $runs)"
+            else
+                kv "$name" "skipped (runs on $runs)"
+            fi
             continue
         fi
 
@@ -307,6 +313,33 @@ do_configs() {
 # ------------------------------------------------------------
 # TIMERS
 # ------------------------------------------------------------
+
+# remove_timer <name> <reason> - tears down a schedule this host should not
+# have, which happens when a script is reclassified to another platform.
+remove_timer() {
+    local name="$1" reason="$2" removed=0
+    if is_macos; then
+        local plist="$HOME/Library/LaunchAgents/$LAUNCHD_PREFIX.$name.plist"
+        if [ -f "$plist" ]; then
+            run launchctl unload "$plist" 2>/dev/null || true
+            run rm -f "$plist"
+            removed=1
+        fi
+    else
+        if [ -f "$CONFIG_HOME/systemd/user/$name.timer" ]; then
+            run systemctl --user disable --now "$name.timer" 2>/dev/null || true
+            run rm -f "$CONFIG_HOME/systemd/user/$name.timer" \
+                "$CONFIG_HOME/systemd/user/$name.service"
+            run systemctl --user daemon-reload
+            removed=1
+        fi
+    fi
+    if [ "$removed" -eq 1 ]; then
+        kv "$name" "schedule removed ($reason)"
+    else
+        kv "$name" "skipped ($reason)"
+    fi
+}
 
 install_timer_systemd() {
     local name="$1" when="$2" args="$3"
@@ -401,7 +434,7 @@ do_timers() {
 
         runs="$(meta_runs_on "$file")"
         if [ "$runs" != any ] && [ "$runs" != "$HOST_KIND" ]; then
-            kv "$name" "skipped (runs on $runs)"
+            remove_timer "$name" "runs on $runs"
             continue
         fi
 

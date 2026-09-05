@@ -4,13 +4,16 @@
 # obsidian-daily - write the day's machine log into your vault
 # ============================================================
 #
-# Runs on: Mac + Pi (bash 3.2 safe)
+# Runs on: Mac (bash 3.2 safe)
 # Requires: git
 #
 # Appends an idempotent block to the Obsidian daily note containing what your
 # machines actually did: commits across every repository, photos added to
 # Immich, and a one line health summary from the Pi. It is a work journal you
 # did not have to write.
+#
+# Marked Mac only because the vault lives there. Point VAULT elsewhere and
+# change the banner if that stops being true.
 #
 # The daily note folder and filename format are read from
 # .obsidian/daily-notes.json rather than hardcoded, so changing the format in
