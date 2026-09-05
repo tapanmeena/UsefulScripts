@@ -1,0 +1,20 @@
+# hdd-sentinel configuration
+#
+# Copied to ~/.config/hdd-sentinel.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Devices to check, space separated. Leave empty to use smartctl --scan, which
+# also reports the correct -d type for USB enclosures.
+DEVICES=""
+
+# Temperatures in Celsius.
+TEMP_WARN=45
+TEMP_CRIT=55
+
+# New USB bus resets since the previous run before warning. Resets are how an
+# enclosure or cable announces it is failing, which SMART never reports.
+USB_RESET_WARN=5
+
+# SMART normalized values count down from 100 toward the failure threshold, so
+# this is roughly "percent of rated load cycles remaining".
+LOAD_CYCLE_NORM_WARN=20

@@ -22,6 +22,8 @@ Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external US
 |--------|--------------|---------|----------|-----------|
 | `repo-sweep` | Ranks git repositories by at-risk work: unpushed commits, stashes, uncommitted changes | Mac, Pi | git | manual |
 | `space-hog` | Categorised, age-aware disk reclaim report, including APFS local snapshots | Mac, Pi | du, find | manual |
+| `disk-runway` | Forecasts days until each filesystem fills, and names what grew | Mac, Pi | df, awk | hourly sample |
+| `hdd-sentinel` | SMART health that alerts on change, plus the USB bus faults SMART cannot see | Pi | smartctl, jq | daily 06:00 |
 | `immich-to-pixel` | Copies new Immich assets to a Pixel over adb so Google Photos backs them up | Pi | curl, jq, adb | manual |
 | `rpistats` | One-screen health dashboard: CPU, memory, storage, network, Docker, Immich | Pi | none | manual |
 
@@ -66,6 +68,24 @@ Every script in this repository follows the same contract, which keeps them pred
 Configuration lives in `~/.config/<script-name>.conf` as plain shell variable assignments. These files hold API keys, so `load_config` refuses to read one that group or others can access. Fix a rejected file with `chmod 600`.
 
 Values in the config file take precedence over environment variables. Every script also accepts `--config PATH` to override the location.
+
+### Privileges
+
+`hdd-sentinel` is the only script that needs root, because `smartctl` talks to the device directly. It uses passwordless sudo when available so it can still run from a user timer. Grant it narrowly:
+
+```sh
+echo "$USER ALL=(root) NOPASSWD: $(command -v smartctl)" | sudo tee /etc/sudoers.d/hdd-sentinel
+```
+
+### Scheduling on a headless machine
+
+systemd user timers only run while a session exists unless lingering is enabled. On a Pi you almost certainly want:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+`./install.sh --check` warns when this is missing.
 
 ### State
 
@@ -157,7 +177,7 @@ Foundation and the Mac-side scripts are complete. Remaining scripts arrive in ph
 |-------|---------|--------|
 | 0 | `lib/common.sh`, `install.sh`, CI | Done |
 | 1 | `repo-sweep`, `space-hog` | Done |
-| 2 | `disk-runway`, `hdd-sentinel` | Pending |
+| 2 | `disk-runway`, `hdd-sentinel` | Done |
 | 3 | `wan-watch`, `boot-story` | Pending |
 | 4 | `obsidian-daily`, plus retrofitting the two original scripts onto the library | Pending |
 

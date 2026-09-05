@@ -1,0 +1,16 @@
+# disk-runway configuration
+#
+# Copied to ~/.config/disk-runway.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Filesystems to track, space separated. Leave empty to track every real
+# block device that df reports.
+MOUNTS=""
+
+# Regression window in days.
+WINDOW_DAYS=30
+
+# Runway thresholds. Below WARN_DAYS the script exits 1, below CRIT_DAYS it
+# exits 2 and sends a notification.
+WARN_DAYS=60
+CRIT_DAYS=14

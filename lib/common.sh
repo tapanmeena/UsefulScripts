@@ -84,6 +84,16 @@ export EX_OK EX_WARN EX_CRIT EX_USAGE EX_LOCKED
 is_macos() { [ "$(uname -s)" = "Darwin" ]; }
 is_linux() { [ "$(uname -s)" = "Linux" ]; }
 
+# Debian's non-interactive PATH omits sbin, so an ssh-invoked script reports
+# smartctl and dumpe2fs as missing when they are installed.
+if is_linux; then
+    case ":$PATH:" in
+        *:/usr/sbin:*) ;;
+        *) PATH="$PATH:/usr/sbin:/sbin" ;;
+    esac
+    export PATH
+fi
+
 is_utf8() {
     case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
         *UTF-8* | *utf-8* | *UTF8* | *utf8*) return 0 ;;
@@ -91,21 +101,36 @@ is_utf8() {
     esac
 }
 
+# These must branch on the platform rather than try BSD and fall back to GNU:
+# GNU `stat -f` means --file-system and exits 0, so a fallback chain silently
+# returns filesystem details instead of the file's metadata.
 stat_size() {
-    stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0 # bash32-lint: allow
+    if is_macos; then
+        stat -f %z "$1" 2>/dev/null || echo 0
+    else
+        stat -c %s "$1" 2>/dev/null || echo 0 # bash32-lint: allow
+    fi
 }
 
 # Three digits, no leading-zero surprises: 600, 044, 700.
 stat_mode() {
     local m
-    m="$(stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null || echo '')" # bash32-lint: allow
+    if is_macos; then
+        m="$(stat -f '%Lp' "$1" 2>/dev/null || echo '')"
+    else
+        m="$(stat -c '%a' "$1" 2>/dev/null || echo '')" # bash32-lint: allow
+    fi
     [ -n "$m" ] || return 1
     while [ "${#m}" -lt 3 ]; do m="0$m"; done
     printf '%s\n' "$m"
 }
 
 stat_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0 # bash32-lint: allow
+    if is_macos; then
+        stat -f %m "$1" 2>/dev/null || echo 0
+    else
+        stat -c %Y "$1" 2>/dev/null || echo 0 # bash32-lint: allow
+    fi
 }
 
 sed_inplace() {
@@ -343,15 +368,26 @@ _release_lock() {
 }
 
 # with_lock <name> <command...>
+#
+# The command runs in the current shell, so it may be a function. That rules
+# out `flock <file> <cmd>`, which execs and would fail with "No such file or
+# directory" for anything that is not a real binary. Uses fd 9, so nesting two
+# with_lock calls in one shell is not supported.
 with_lock() {
     local name="$1"
     shift
-    local dir
+    local dir rc=0
     dir="$(state_dir "$name")"
 
     if command -v flock >/dev/null 2>&1; then
-        flock -n -E "$EX_LOCKED" "$dir/lock" "$@"
-        return $?
+        exec 9>"$dir/lock" || return "$EX_LOCKED"
+        if ! flock -n 9; then
+            exec 9>&-
+            return "$EX_LOCKED"
+        fi
+        "$@" || rc=$?
+        exec 9>&-
+        return "$rc"
     fi
 
     # macOS has no flock(1). mkdir is atomic everywhere; the pid file lets us
@@ -371,7 +407,6 @@ with_lock() {
     _LOCK_DIR="$lockdir"
     on_exit _release_lock
 
-    local rc=0
     "$@" || rc=$?
     _release_lock
     return "$rc"

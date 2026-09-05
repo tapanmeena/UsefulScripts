@@ -74,6 +74,7 @@ Usage: install.sh [options]
   --check          Report dependencies, configs, and timer status; change nothing.
   --uninstall      Remove symlinks and timers. Never touches configs or state.
   --target HOST    rsync this repo to HOST and install there over SSH.
+  --remote-path P  Where to sync on the target (default ~/UsefulScripts).
   --dry-run        Print what would happen; change nothing.
   -h, --help       Show this help.
 EOF
@@ -87,6 +88,10 @@ while [ $# -gt 0 ]; do
             ;;
         --target)
             TARGET="${2:?--target needs a value}"
+            shift 2
+            ;;
+        --remote-path)
+            REMOTE_PATH="${2:?--remote-path needs a value}"
             shift 2
             ;;
         --no-timers)
@@ -193,6 +198,17 @@ systemd_calendar() {
     esac
 }
 
+# Without lingering, systemd user timers only run while a session is open, so a
+# headless box silently never fires them.
+linger_enabled() {
+    is_linux || return 0
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local l
+    l="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null ||
+        loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+    [ "$l" = yes ]
+}
+
 # ------------------------------------------------------------
 # REMOTE
 # ------------------------------------------------------------
@@ -200,7 +216,9 @@ systemd_calendar() {
 if [ -n "$TARGET" ]; then
     require_tools rsync ssh
     info "syncing $REPO_DIR -> $TARGET:$REMOTE_PATH"
-    run rsync -az --delete \
+    # No --delete: the remote copy is often a git checkout with its own state,
+    # and silently removing files there is not worth the tidiness.
+    run rsync -az \
         --exclude '.git' --exclude '.DS_Store' \
         "$REPO_DIR/" "$TARGET:$REMOTE_PATH/"
 
@@ -393,6 +411,11 @@ do_timers() {
             install_timer_systemd "$name" "$when" "$args"
         fi
     done
+
+    if ! linger_enabled; then
+        warn "user lingering is off, so these timers only run while you are logged in.
+      Enable it with: sudo loginctl enable-linger $(id -un)"
+    fi
 }
 
 # ------------------------------------------------------------
@@ -476,6 +499,12 @@ do_check() {
 
     printf '\n%bLINK%b MISSING means run ./install.sh.  ' "$DIM" "$NC"
     printf '%bCONFIG%b shows file mode; a trailing ! means it is not 600.\n' "$DIM" "$NC"
+
+    if is_linux && ! linger_enabled; then
+        printf '\n'
+        warn "user lingering is off: timers only run while you are logged in.
+      Enable it with: sudo loginctl enable-linger $(id -un)"
+    fi
 }
 
 # ------------------------------------------------------------
