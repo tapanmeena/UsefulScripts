@@ -1,0 +1,8 @@
+# boot-story configuration
+#
+# Copied to ~/.config/boot-story.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# How close to boot an apt run must be before it is treated as the likely
+# reason for a clean reboot.
+APT_WINDOW_MIN=30

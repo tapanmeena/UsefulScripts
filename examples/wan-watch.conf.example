@@ -1,0 +1,39 @@
+# wan-watch configuration
+#
+# Copied to ~/.config/wan-watch.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Public anchors used to measure transit. The best result wins, so one unhappy
+# resolver does not look like an outage.
+ANCHORS="1.1.1.1 8.8.8.8"
+
+# Name resolved to time DNS separately, because resolution failures feel like
+# the internet being down but are a different fault.
+DNS_NAME="cloudflare.com"
+
+# Packets per anchor per probe.
+PING_COUNT=10
+
+# Consecutive failures before an outage opens, and successes before it closes.
+# Hysteresis keeps a single dropped packet from creating an outage record.
+FAIL_STREAK=3
+OK_STREAK=2
+
+# Minutes between public IP lookups. The probe runs every minute; checking an
+# external service that often would be rude.
+PUBLIC_IP_EVERY=15
+
+# Skip the throughput test when the link is already carrying more than this,
+# otherwise you measure your own backup running.
+BUSY_KB_S=200
+
+# Bufferbloat load generator. Cloudflare's endpoint is anycast, so it is served
+# from a nearby edge. It refuses requests much above 50MB, which is why the
+# load is looped for a duration instead of requesting one huge file.
+BLOAT_URL="https://speed.cloudflare.com/__down?bytes=52428800"
+BLOAT_STREAMS=4
+BLOAT_SECONDS=12
+
+# Throughput below which a bufferbloat grade is called unreliable. Leave empty
+# to derive it from the most recent measured capacity.
+BLOAT_MIN_KB_S=""

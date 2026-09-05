@@ -48,8 +48,6 @@ _lib="$(dirname "$0")/lib/common.sh"
 # shellcheck source=lib/common.sh
 . "$_lib"
 
-require_linux
-
 TAB="$(printf '\t')"
 
 # ------------------------------------------------------------
@@ -128,6 +126,8 @@ case "$TEST_KIND" in
     *) die "--test takes short or long, not $TEST_KIND" ;;
 esac
 
+# Checked after argument parsing so --help works on any platform.
+require_linux
 require_tools smartctl jq
 
 STATE="$(state_dir hdd-sentinel)"

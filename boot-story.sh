@@ -34,9 +34,6 @@ _lib="$(dirname "$0")/lib/common.sh"
 # shellcheck source=lib/common.sh
 . "$_lib"
 
-require_linux
-require_tools journalctl
-
 TAB="$(printf '\t')"
 
 # ------------------------------------------------------------
@@ -91,6 +88,10 @@ done
 # ------------------------------------------------------------
 # BOOT INVENTORY
 # ------------------------------------------------------------
+
+# Checked after argument parsing so --help works on any platform.
+require_linux
+require_tools journalctl
 
 jrn() { journalctl "$@" 2>/dev/null || true; }
 

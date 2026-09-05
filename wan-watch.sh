@@ -47,9 +47,6 @@ _lib="$(dirname "$0")/lib/common.sh"
 # shellcheck source=lib/common.sh
 . "$_lib"
 
-require_linux
-require_tools ping awk
-
 NOW="$(date +%s)"
 
 # ------------------------------------------------------------
@@ -135,6 +132,10 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1 (try --help)" ;;
     esac
 done
+
+# Checked after argument parsing so --help works on any platform.
+require_linux
+require_tools ping awk
 
 STATE="$(state_dir wan-watch)"
 SAMPLES="$STATE/samples-$(date +%Y-%m).csv"

@@ -24,6 +24,8 @@ Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external US
 | `space-hog` | Categorised, age-aware disk reclaim report, including APFS local snapshots | Mac, Pi | du, find | manual |
 | `disk-runway` | Forecasts days until each filesystem fills, and names what grew | Mac, Pi | df, awk | hourly sample |
 | `hdd-sentinel` | SMART health that alerts on change, plus the USB bus faults SMART cannot see | Pi | smartctl, jq | daily 06:00 |
+| `wan-watch` | Continuous connection quality, bufferbloat grading, and outage records | Pi | ping, awk | probe every minute |
+| `boot-story` | Explains why the machine last rebooted, with ranked evidence | Pi | journalctl | manual |
 | `immich-to-pixel` | Copies new Immich assets to a Pixel over adb so Google Photos backs them up | Pi | curl, jq, adb | manual |
 | `rpistats` | One-screen health dashboard: CPU, memory, storage, network, Docker, Immich | Pi | none | manual |
 
@@ -178,7 +180,7 @@ Foundation and the Mac-side scripts are complete. Remaining scripts arrive in ph
 | 0 | `lib/common.sh`, `install.sh`, CI | Done |
 | 1 | `repo-sweep`, `space-hog` | Done |
 | 2 | `disk-runway`, `hdd-sentinel` | Done |
-| 3 | `wan-watch`, `boot-story` | Pending |
+| 3 | `wan-watch`, `boot-story` | Done |
 | 4 | `obsidian-daily`, plus retrofitting the two original scripts onto the library | Pending |
 
 ## Development
