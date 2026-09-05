@@ -359,24 +359,24 @@ on_exit() {
 # ------------------------------------------------------------
 
 _LOCK_DIR=''
+_LOCK_FD_HELD=0
 
 _release_lock() {
+    if [ "$_LOCK_FD_HELD" -eq 1 ]; then
+        exec 9>&-
+        _LOCK_FD_HELD=0
+    fi
     [ -n "$_LOCK_DIR" ] || return 0
     rm -f "$_LOCK_DIR/pid" 2>/dev/null || true
     rmdir "$_LOCK_DIR" 2>/dev/null || true
     _LOCK_DIR=''
 }
 
-# with_lock <name> <command...>
-#
-# The command runs in the current shell, so it may be a function. That rules
-# out `flock <file> <cmd>`, which execs and would fail with "No such file or
-# directory" for anything that is not a real binary. Uses fd 9, so nesting two
-# with_lock calls in one shell is not supported.
-with_lock() {
-    local name="$1"
-    shift
-    local dir rc=0
+# acquire_lock <name> - hold the lock for the rest of this process, releasing
+# it on exit. Returns EX_LOCKED when another copy has it. Linear scripts that
+# cannot wrap their work in a function want this rather than with_lock.
+acquire_lock() {
+    local name="$1" dir
     dir="$(state_dir "$name")"
 
     if command -v flock >/dev/null 2>&1; then
@@ -385,9 +385,9 @@ with_lock() {
             exec 9>&-
             return "$EX_LOCKED"
         fi
-        "$@" || rc=$?
-        exec 9>&-
-        return "$rc"
+        _LOCK_FD_HELD=1
+        on_exit _release_lock
+        return 0
     fi
 
     # macOS has no flock(1). mkdir is atomic everywhere; the pid file lets us
@@ -406,7 +406,20 @@ with_lock() {
     printf '%s\n' "$$" >"$lockdir/pid"
     _LOCK_DIR="$lockdir"
     on_exit _release_lock
+    return 0
+}
 
+# with_lock <name> <command...>
+#
+# The command runs in the current shell, so it may be a function. That rules
+# out `flock <file> <cmd>`, which execs and would fail with "No such file or
+# directory" for anything that is not a real binary. Uses fd 9, so nesting two
+# locks in one shell is not supported.
+with_lock() {
+    local name="$1"
+    shift
+    local rc=0
+    acquire_lock "$name" || return "$EX_LOCKED"
     "$@" || rc=$?
     _release_lock
     return "$rc"

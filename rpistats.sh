@@ -1,248 +1,267 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
+#
 # ============================================================
-# Raspberry Pi System Health
+# rpistats - Raspberry Pi system health on one screen
+# ============================================================
+#
+# Runs on: Pi (bash 5)
+# Requires: awk
+#
+# CPU, memory, storage, network, services and Immich containers, colour coded
+# against thresholds so problems stand out without reading the numbers.
+#
+# --oneline collapses the whole report to a single line, which is what
+# obsidian-daily embeds in the daily note.
+#
+# Config file (default ~/.config/rpistats.conf, mode 600):
+#   SERVICES="ssh docker"
+#   IMMICH_CONTAINERS="immich_postgres=PostgreSQL immich_server=Server"
+#   TEMP_WARN=60
+#   TEMP_CRIT=70
+#
+# Usage:  rpistats.sh [--oneline]
 # ============================================================
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+set -euo pipefail
 
-print_status() {
-    local label="$1"
-    local status="$2"
+# install.sh symlinks this into ~/.local/bin, where dirname "$0" points at the
+# symlink rather than the repo. The symlinks it creates are absolute.
+_lib="$(dirname "$0")/lib/common.sh"
+[ -f "$_lib" ] || _lib="$(dirname "$(readlink "$0")")/lib/common.sh"
+# shellcheck source=lib/common.sh
+. "$_lib"
 
-    case "$status" in
-        running|active|healthy)
-            printf "%-24s ${GREEN}%s${NC}\n" "$label" "$status"
-            ;;
-        warning|degraded)
-            printf "%-24s ${YELLOW}%s${NC}\n" "$label" "$status"
-            ;;
-        *)
-            printf "%-24s ${RED}%s${NC}\n" "$label" "$status"
-            ;;
-    esac
+TAB="$(printf '\t')"
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+load_config rpistats
+
+SERVICES="${SERVICES:-ssh docker}"
+# container=Label pairs, space separated. Labels cannot contain spaces.
+IMMICH_CONTAINERS="${IMMICH_CONTAINERS:-immich_postgres=PostgreSQL immich_server=Server immich_redis=Cache immich_machine_learning=ML}"
+TEMP_WARN="${TEMP_WARN:-60}"
+TEMP_CRIT="${TEMP_CRIT:-70}"
+DISK_WARN="${DISK_WARN:-85}"
+DISK_CRIT="${DISK_CRIT:-95}"
+ROOT_WARN="${ROOT_WARN:-90}"
+
+ONELINE=0
+
+usage() {
+    cat <<'EOF'
+Raspberry Pi health: CPU, memory, storage, network, services, Immich.
+
+Usage: rpistats.sh [options]
+
+  --oneline    Collapse the report to a single line for embedding elsewhere.
+  -h, --help   Show this help.
+
+Settings (config file wins over environment):
+  SERVICES, IMMICH_CONTAINERS, TEMP_WARN, TEMP_CRIT, DISK_WARN, DISK_CRIT
+EOF
 }
 
-printf "\n${BLUE}===== Raspberry Pi Health =====${NC}\n"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --oneline)
+            ONELINE=1
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# Checked after argument parsing so --help works on any platform.
+require_linux
 
 # ------------------------------------------------------------
-# SYSTEM
+# MEASUREMENTS
 # ------------------------------------------------------------
 
-printf "\n${BLUE}System${NC}\n"
+cpu_temp() {
+    local raw
+    raw="$(vcgencmd measure_temp 2>/dev/null | cut -d '=' -f2 || true)"
+    printf '%s' "${raw%\'C}"
+}
 
-printf "%-24s %s\n" "Hostname" "$(hostname)"
-printf "%-24s %s\n" "Uptime" "$(uptime -p)"
-printf "%-24s %s\n" "Load Average" "$(awk '{print $1", "$2", "$3}' /proc/loadavg)"
-
-# ------------------------------------------------------------
-# CPU
-# ------------------------------------------------------------
-
-printf "\n${BLUE}CPU${NC}\n"
-
-TEMP_RAW=$(vcgencmd measure_temp 2>/dev/null | cut -d '=' -f2)
-TEMP_C=${TEMP_RAW::-2}
-
-if [ -n "$TEMP_C" ]; then
-    if (( $(echo "$TEMP_C >= 70" | bc -l) )); then
-        TEMP_COLOR=$RED
-    elif (( $(echo "$TEMP_C >= 60" | bc -l) )); then
-        TEMP_COLOR=$YELLOW
-    else
-        TEMP_COLOR=$GREEN
-    fi
-
-    printf "%-24s ${TEMP_COLOR}%s°C${NC}\n" "Temperature" "$TEMP_C"
-fi
-
-CPU_USE=$(top -bn1 | awk -F'[,:%]' '/Cpu\(s\)/ {
-    for (i=1; i<=NF; i++) {
-        if ($i ~ /id/) {
-            gsub(/[^0-9.]/, "", $(i-1))
-            print 100 - $(i-1)
-            exit
+cpu_usage() {
+    { top -bn1 2>/dev/null || true; } | awk -F'[,:%]' '/Cpu\(s\)/ {
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /id/) {
+                gsub(/[^0-9.]/, "", $(i - 1))
+                printf "%.1f", 100 - $(i - 1)
+                exit
+            }
         }
-    }
-}')
-
-printf "%-24s %.1f%%\n" "CPU Usage" "$CPU_USE"
-
-CLOCK=$(vcgencmd measure_clock arm 2>/dev/null |
-    awk -F= '{printf "%.0f MHz", $2/1000000}')
-
-printf "%-24s %s\n" "CPU Clock" "$CLOCK"
-
-TOP_PROC=$(ps -eo comm,%cpu --sort=-%cpu | sed -n '2p')
-printf "%-24s %s\n" "Top CPU Process" "$TOP_PROC"
-
-# ------------------------------------------------------------
-# MEMORY
-# ------------------------------------------------------------
-
-printf "\n${BLUE}Memory${NC}\n"
-
-MEM_TOTAL=$(free -h | awk '/Mem:/ {print $2}')
-MEM_USED=$(free -h | awk '/Mem:/ {print $3}')
-MEM_AVAILABLE=$(free -h | awk '/Mem:/ {print $7}')
-MEM_PERCENT=$(free | awk '/Mem:/ {printf "%.1f%%", $3/$2*100}')
-
-SWAP_TOTAL=$(free -h | awk '/Swap:/ {print $2}')
-SWAP_USED=$(free -h | awk '/Swap:/ {print $3}')
-
-printf "%-24s %s\n" "RAM Total" "$MEM_TOTAL"
-printf "%-24s %s\n" "RAM Used" "$MEM_USED"
-printf "%-24s %s\n" "RAM Available" "$MEM_AVAILABLE"
-printf "%-24s %s\n" "RAM Usage" "$MEM_PERCENT"
-
-printf "%-24s %s / %s\n" "Swap Used" "$SWAP_USED" "$SWAP_TOTAL"
-
-# ------------------------------------------------------------
-# STORAGE
-# ------------------------------------------------------------
-
-printf "\n${BLUE}Storage${NC}\n"
-
-ROOT_INFO=$(df -h / | awk 'NR==2 {
-    printf "%s / %s used / %s free (%s)",
-    $2, $3, $4, $5
-}')
-
-printf "%-24s %s\n" "Root (/)" "$ROOT_INFO"
-
-ROOT_USED=$(df / | awk 'NR==2 {gsub("%","",$5); print $5}')
-
-if [ "$ROOT_USED" -ge 90 ]; then
-    printf "${RED}WARNING: Root filesystem is %s%% full${NC}\n" "$ROOT_USED"
-fi
-
-printf "\nExternal HDDs:\n"
-
-FOUND_HDD=false
-
-while read -r DEVICE SIZE MOUNTPOINT; do
-
-    [ -z "$MOUNTPOINT" ] && continue
-
-    FOUND_HDD=true
-
-    DF_INFO=$(df -h "$MOUNTPOINT" | awk 'NR==2 {
-        printf "%s total / %s used / %s free (%s)",
-        $2, $3, $4, $5
-    }')
-
-    USAGE=$(df "$MOUNTPOINT" | awk 'NR==2 {
-        gsub("%","",$5)
-        print $5
-    }')
-
-    if [ "$USAGE" -ge 95 ]; then
-        COLOR=$RED
-    elif [ "$USAGE" -ge 85 ]; then
-        COLOR=$YELLOW
-    else
-        COLOR=$GREEN
-    fi
-
-    printf "\n  Device      : %s\n" "$DEVICE"
-    printf "  Mount Point : %s\n" "$MOUNTPOINT"
-    printf "  Usage       : ${COLOR}%s${NC}\n" "$DF_INFO"
-
-    if [ "$USAGE" -ge 95 ]; then
-        printf "  ${RED}WARNING: Disk almost full${NC}\n"
-    fi
-
-done < <(
-    lsblk -pnro NAME,TYPE,MOUNTPOINT |
-    awk '$2 == "part" && $1 ~ /^\/dev\/sd[a-z][0-9]+$/ && $3 != "" {
-        print $1, $1, $3
     }'
-)
+}
 
-if [ "$FOUND_HDD" = false ]; then
-    printf "  ${RED}No mounted external HDDs found${NC}\n"
+mem_percent() { free 2>/dev/null | awk '/Mem:/ { printf "%.1f", $3 / $2 * 100 }'; }
+root_percent() { df -P / 2>/dev/null | awk 'NR==2 { gsub("%", "", $5); print $5 }'; }
+
+# Mounted partitions on external USB disks as "device<TAB>mount<TAB>use%".
+external_disks() {
+    local dev mp use
+    lsblk -pnro NAME,TYPE,MOUNTPOINT 2>/dev/null |
+        awk '$2 == "part" && $1 ~ /^\/dev\/sd[a-z][0-9]+$/ && $3 != "" { print $1, $3 }' |
+        while read -r dev mp; do
+            use="$(df -P "$mp" 2>/dev/null | awk 'NR==2 { gsub("%", "", $5); print $5 }')"
+            [ -n "$use" ] && printf '%s\t%s\t%s\n' "$dev" "$mp" "$use"
+        done
+}
+
+container_state() {
+    local name="$1" status health
+    command -v docker >/dev/null 2>&1 || {
+        printf 'no docker'
+        return 0
+    }
+    status="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    [ -n "$status" ] || {
+        printf 'not found'
+        return 0
+    }
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || true)"
+    if [ "$status" = running ] && [ "$health" = unhealthy ]; then
+        printf 'running / UNHEALTHY'
+    elif [ "$status" = running ] && [ "$health" = healthy ]; then
+        printf 'running / healthy'
+    else
+        printf '%s' "$status"
+    fi
+}
+
+# ------------------------------------------------------------
+# ONELINE
+# ------------------------------------------------------------
+
+if [ "$ONELINE" -eq 1 ]; then
+    line="$(hostname) up $(uptime -p 2>/dev/null | sed 's/^up //' || echo '?')"
+    t="$(cpu_temp)"
+    [ -n "$t" ] && line="$line | cpu ${t}C $(cpu_usage)%"
+    line="$line | ram $(mem_percent)% | / $(root_percent)%"
+
+    while IFS="$TAB" read -r _ mp use; do
+        [ -n "$mp" ] || continue
+        line="$line | $(basename "$mp") ${use}%"
+    done <<EOF
+$(external_disks)
+EOF
+
+    down=0
+    for spec in $IMMICH_CONTAINERS; do
+        case "$(container_state "${spec%%=*}")" in
+            running*) ;;
+            *) down=$((down + 1)) ;;
+        esac
+    done
+    if [ "$down" -eq 0 ]; then
+        line="$line | immich ok"
+    else
+        line="$line | immich $down down"
+    fi
+
+    printf '%s\n' "$line"
+    exit "$EX_OK"
 fi
 
 # ------------------------------------------------------------
-# NETWORK
+# REPORT
 # ------------------------------------------------------------
 
-printf "\n${BLUE}Network${NC}\n"
+print_status() {
+    local label="$1" status="$2" color
+    case "$status" in
+        running* | active | healthy) color="$GREEN" ;;
+        warning | degraded) color="$YELLOW" ;;
+        *) color="$RED" ;;
+    esac
+    printf "%-${KV_WIDTH}s %b%s%b\n" "$label" "$color" "$status" "$NC"
+}
 
-ip -4 -o addr show up |
-awk '$2 !~ /^(lo|docker.*|br-.*)$/ {
-    split($4, a, "/")
-    printf "%-24s %s\n", $2, a[1]
-}'
+section "===== Raspberry Pi Health ====="
 
-# ------------------------------------------------------------
-# SERVICES
-# ------------------------------------------------------------
+section "System"
+kv "Hostname" "$(hostname)"
+kv "Uptime" "$(uptime -p 2>/dev/null || true)"
+kv "Load Average" "$(awk '{ print $1", "$2", "$3 }' /proc/loadavg)"
 
-printf "\n${BLUE}System Services${NC}\n"
-
-for svc in ssh docker; do
-    STATUS=$(systemctl is-active "$svc" 2>/dev/null)
-
-    if [ "$STATUS" = "active" ]; then
-        print_status "$svc" "running"
+section "CPU"
+TEMP_C="$(cpu_temp)"
+if [ -n "$TEMP_C" ]; then
+    if awk -v t="$TEMP_C" -v c="$TEMP_CRIT" 'BEGIN { exit !(t >= c) }'; then
+        TEMP_COLOR="$RED"
+    elif awk -v t="$TEMP_C" -v w="$TEMP_WARN" 'BEGIN { exit !(t >= w) }'; then
+        TEMP_COLOR="$YELLOW"
     else
-        print_status "$svc" "stopped"
+        TEMP_COLOR="$GREEN"
+    fi
+    printf "%-${KV_WIDTH}s %b%s°C%b\n" "Temperature" "$TEMP_COLOR" "$TEMP_C" "$NC"
+fi
+kv "CPU Usage" "$(cpu_usage)%"
+kv "CPU Clock" "$({ vcgencmd measure_clock arm 2>/dev/null || true; } | awk -F= '{ printf "%.0f MHz", $2 / 1000000 }')"
+kv "Top CPU Process" "$({ ps -eo comm,%cpu --sort=-%cpu 2>/dev/null || true; } | sed -n '2p')"
+
+section "Memory"
+kv "RAM Total" "$(free -h | awk '/Mem:/ { print $2 }')"
+kv "RAM Used" "$(free -h | awk '/Mem:/ { print $3 }')"
+kv "RAM Available" "$(free -h | awk '/Mem:/ { print $7 }')"
+kv "RAM Usage" "$(mem_percent)%"
+kv "Swap Used" "$(free -h | awk '/Swap:/ { print $3" / "$2 }')"
+
+section "Storage"
+kv "Root (/)" "$(df -h / | awk 'NR==2 { printf "%s / %s used / %s free (%s)", $2, $3, $4, $5 }')"
+ROOT_USED="$(root_percent)"
+if [ -n "$ROOT_USED" ] && [ "$ROOT_USED" -ge "$ROOT_WARN" ]; then
+    printf '%bWARNING: root filesystem is %s%% full%b\n' "$RED" "$ROOT_USED" "$NC"
+fi
+
+printf '\nExternal disks:\n'
+FOUND=0
+while IFS="$TAB" read -r dev mp use; do
+    [ -n "$dev" ] || continue
+    FOUND=1
+    if [ "$use" -ge "$DISK_CRIT" ]; then
+        COLOR="$RED"
+    elif [ "$use" -ge "$DISK_WARN" ]; then
+        COLOR="$YELLOW"
+    else
+        COLOR="$GREEN"
+    fi
+    printf '\n  Device      : %s\n' "$dev"
+    printf '  Mount Point : %s\n' "$mp"
+    printf '  Usage       : %b%s%b\n' "$COLOR" \
+        "$(df -h "$mp" | awk 'NR==2 { printf "%s total / %s used / %s free (%s)", $2, $3, $4, $5 }')" "$NC"
+    [ "$use" -ge "$DISK_CRIT" ] && printf '  %bWARNING: disk almost full%b\n' "$RED" "$NC"
+done <<EOF
+$(external_disks)
+EOF
+[ "$FOUND" -eq 1 ] || printf '  %bno mounted external disks found%b\n' "$RED" "$NC"
+
+section "Network"
+ip -4 -o addr show up 2>/dev/null |
+    awk '$2 !~ /^(lo|docker.*|br-.*|veth.*)$/ { split($4, a, "/"); printf "%-24s %s\n", $2, a[1] }'
+
+section "System Services"
+for svc in $SERVICES; do
+    if [ "$(systemctl is-active "$svc" 2>/dev/null || true)" = active ]; then
+        print_status "$svc" running
+    else
+        print_status "$svc" stopped
     fi
 done
 
-# ------------------------------------------------------------
-# IMMICH
-# ------------------------------------------------------------
+section "Immich"
+for spec in $IMMICH_CONTAINERS; do
+    [ -n "$spec" ] || continue
+    print_status "${spec#*=}" "$(container_state "${spec%%=*}")"
+done
 
-printf "\n${BLUE}Immich${NC}\n"
-
-check_immich_container() {
-    local NAME="$1"
-    local LABEL="$2"
-
-    local STATUS
-    local HEALTH
-    local RESTARTS
-
-    STATUS=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null)
-    HEALTH=$(docker inspect -f \
-        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-        "$NAME" 2>/dev/null)
-    RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$NAME" 2>/dev/null)
-
-    if [ -z "$STATUS" ]; then
-        print_status "$LABEL" "not found"
-        return
-    fi
-
-    if [ "$STATUS" = "running" ]; then
-
-        if [ "$HEALTH" = "healthy" ]; then
-            print_status "$LABEL" "running / healthy"
-        elif [ "$HEALTH" = "unhealthy" ]; then
-            print_status "$LABEL" "running / UNHEALTHY"
-        else
-            print_status "$LABEL" "running"
-        fi
-
-        if [ "$RESTARTS" -gt 0 ]; then
-            printf "  Restarts: %s\n" "$RESTARTS"
-        fi
-
-    else
-        print_status "$LABEL" "$STATUS"
-    fi
-}
-
-check_immich_container "immich_postgres" "PostgreSQL"
-check_immich_container "immich_server" "Immich Server"
-check_immich_container "immich_redis" "Immich Cache"
-check_immich_container "immich_machine_learning" "Immich ML"
-
-printf "\n${BLUE}================================${NC}\n\n"
+printf '\n'

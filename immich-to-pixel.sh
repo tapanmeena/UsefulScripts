@@ -11,6 +11,9 @@
 # so Google Photos starts uploading, then continue. An asset is only recorded as
 # done once it has been indexed, and files awaiting indexing are never pruned.
 #
+# Runs on: Pi (bash 5)
+# Requires: curl jq adb
+#
 # Host requirements:  bash, curl, jq, adb
 #
 # One-time phone setup:
@@ -33,98 +36,12 @@
 
 set -euo pipefail
 
-# ------------------------------------------------------------
-# OUTPUT
-# ------------------------------------------------------------
-
-if [ -t 1 ]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    BLUE='\033[0;34m'
-    NC='\033[0m'
-else
-    RED='' GREEN='' YELLOW='' BLUE='' NC=''
-fi
-
-info() { clear_progress; printf '%b%s%b\n' "$BLUE" "$*" "$NC"; }
-ok()   { clear_progress; printf '%b%s%b\n' "$GREEN" "$*" "$NC"; }
-warn() { clear_progress; printf '%bwarn:%b %s\n' "$YELLOW" "$NC" "$*" >&2; }
-die()  { clear_progress; printf '%berror:%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
-
-# ------------------------------------------------------------
-# PROGRESS
-#
-# Drawn on stderr so stdout stays pipeable. Every log helper clears the line
-# first, otherwise warnings would land on top of a half-drawn bar.
-# ------------------------------------------------------------
-
-if [ -t 2 ]; then PROGRESS_TTY=1; else PROGRESS_TTY=0; fi
-PROGRESS_ACTIVE=0
-
-TERM_COLS="$(tput cols 2>/dev/null || echo 80)"
-case "$TERM_COLS" in
-    ''|*[!0-9]*) TERM_COLS=80 ;;
-esac
-[ "$TERM_COLS" -lt 40 ] && TERM_COLS=80
-
-clear_progress() {
-    if [ "$PROGRESS_ACTIVE" -eq 1 ]; then
-        printf '\r\033[K' >&2
-        PROGRESS_ACTIVE=0
-    fi
-}
-
-finish_progress() {
-    if [ "$PROGRESS_ACTIVE" -eq 1 ]; then
-        printf '\n' >&2
-        PROGRESS_ACTIVE=0
-    fi
-}
-
-# render_progress <done> <total> <sent_kb> <elapsed_s> <label>
-# Pass 0 for sent_kb to omit the throughput field.
-render_progress() {
-    local cur="$1" tot="$2" kb="$3" secs="$4" label="$5"
-    [ "$tot" -gt 0 ] || return 0
-
-    if [ "$PROGRESS_TTY" -eq 0 ]; then
-        # Non-interactive: an occasional line instead of thousands.
-        if [ "$cur" -gt 0 ] && [ $(( cur % 50 )) -eq 0 ]; then
-            printf '[%d/%d] %d%% %s\n' "$cur" "$tot" $(( cur * 100 / tot )) "$label" >&2
-        fi
-        return 0
-    fi
-
-    local width=24 pct filled i=0 bar='' eta='--:--' stats='' rate10 rem head label_max
-    pct=$(( cur * 100 / tot ))
-    filled=$(( pct * width / 100 ))
-    while [ "$i" -lt "$width" ]; do
-        if [ "$i" -lt "$filled" ]; then bar="$bar="; else bar="$bar "; fi
-        i=$(( i + 1 ))
-    done
-
-    if [ "$secs" -gt 0 ]; then
-        if [ "$kb" -gt 0 ]; then
-            rate10=$(( kb * 10 / secs / 1024 ))
-            printf -v stats '  %d.%dMB/s' $(( rate10 / 10 )) $(( rate10 % 10 ))
-        fi
-        if [ "$cur" -gt 0 ]; then
-            rem=$(( (tot - cur) * secs / cur ))
-            printf -v eta '%02d:%02d' $(( rem / 60 )) $(( rem % 60 ))
-        fi
-    fi
-
-    # Measure the prefix and trim the label to match. A wrapped line would leave
-    # residue behind the \r redraw.
-    printf -v head '[%s] %3d%%  %d/%d%s  ETA %s  ' \
-        "$bar" "$pct" "$cur" "$tot" "$stats" "$eta"
-    label_max=$(( TERM_COLS - ${#head} - 1 ))
-    [ "$label_max" -lt 8 ] && label_max=8
-
-    printf '\r\033[K%s%s' "$head" "${label:0:label_max}" >&2
-    PROGRESS_ACTIVE=1
-}
+# install.sh symlinks this into ~/.local/bin, where dirname "$0" points at the
+# symlink rather than the repo. The symlinks it creates are absolute.
+_lib="$(dirname "$0")/lib/common.sh"
+[ -f "$_lib" ] || _lib="$(dirname "$(readlink "$0")")/lib/common.sh"
+# shellcheck source=lib/common.sh
+. "$_lib"
 
 usage() {
     cat <<'EOF'
@@ -161,19 +78,40 @@ SINCE_OVERRIDE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run)     DRY_RUN=1; shift ;;
-        --scan-volume) SCAN_VOLUME=1; shift ;;
-        --limit)       LIMIT="${2:?--limit needs a value}"; shift 2 ;;
-        --batch)       BATCH_OVERRIDE="${2:?--batch needs a value}"; shift 2 ;;
-        --since)       SINCE_OVERRIDE="${2:?--since needs a value}"; shift 2 ;;
-        --config)      CONFIG_FILE="${2:?--config needs a value}"; shift 2 ;;
-        -h|--help)     usage; exit 0 ;;
-        *)             die "unknown option: $1 (try --help)" ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --scan-volume)
+            SCAN_VOLUME=1
+            shift
+            ;;
+        --limit)
+            LIMIT="${2:?--limit needs a value}"
+            shift 2
+            ;;
+        --batch)
+            BATCH_OVERRIDE="${2:?--batch needs a value}"
+            shift 2
+            ;;
+        --since)
+            SINCE_OVERRIDE="${2:?--since needs a value}"
+            shift 2
+            ;;
+        --config)
+            CONFIG_FILE="${2:?--config needs a value}"
+            shift 2
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown option: $1 (try --help)" ;;
     esac
 done
 
 case "$LIMIT" in
-    ''|*[!0-9]*) die "--limit must be a non-negative integer" ;;
+    '' | *[!0-9]*) die "--limit must be a non-negative integer" ;;
 esac
 
 # ------------------------------------------------------------
@@ -197,7 +135,7 @@ BATCH_SIZE="${BATCH_SIZE:-50}"
 [ -n "$BATCH_OVERRIDE" ] && BATCH_SIZE="$BATCH_OVERRIDE"
 
 case "$BATCH_SIZE" in
-    ''|*[!0-9]*|0) die "BATCH_SIZE must be a positive integer" ;;
+    '' | *[!0-9]* | 0) die "BATCH_SIZE must be a positive integer" ;;
 esac
 
 # adb shell re-splits the command on the device, so an unquoted path with
@@ -226,6 +164,14 @@ done
 # ------------------------------------------------------------
 
 mkdir -p "$STATE_DIR"
+
+# Two overlapping runs would interleave their writes to the cursor file and
+# silently skip whatever the loser had already transferred.
+if ! acquire_lock immich-to-pixel; then
+    warn "another copy is already running"
+    exit "$EX_LOCKED"
+fi
+
 CURSOR_FILE="$STATE_DIR/cursor"
 PUSHED_FILE="$STATE_DIR/pushed.txt"
 touch "$PUSHED_FILE"
@@ -246,7 +192,7 @@ chmod 700 "$WORK_DIR"
 # Remote filenames pushed but not yet indexed. Google Photos has had no chance
 # to see these, so pruning must leave them alone.
 PROTECT_FILE="$WORK_DIR/protect.txt"
-: > "$PROTECT_FILE"
+: >"$PROTECT_FILE"
 declare -a batch_names=()
 declare -a batch_ids=()
 batch_cursor=""
@@ -254,12 +200,12 @@ batch_cursor=""
 finish() {
     local rc=$?
     if [ "$DRY_RUN" -eq 0 ] && [ "$new_cursor" != "$cursor" ]; then
-        printf '%s\n' "$new_cursor" > "$CURSOR_FILE" || true
+        printf '%s\n' "$new_cursor" >"$CURSOR_FILE" || true
     fi
     rm -rf "$WORK_DIR" || true
     return $rc
 }
-trap finish EXIT
+on_exit finish
 
 # ------------------------------------------------------------
 # IMMICH API
@@ -267,9 +213,12 @@ trap finish EXIT
 
 # Keep the API key out of the process table.
 CURL_CFG="$WORK_DIR/curl.cfg"
-(umask 077; printf 'header = "x-api-key: %s"\n' "$IMMICH_API_KEY" > "$CURL_CFG")
+(
+    umask 077
+    printf 'header = "x-api-key: %s"\n' "$IMMICH_API_KEY" >"$CURL_CFG"
+)
 
-api_get()  { curl -sS -f -K "$CURL_CFG" "$IMMICH_URL/api$1"; }
+api_get() { curl -sS -f -K "$CURL_CFG" "$IMMICH_URL/api$1"; }
 api_post() {
     curl -sS -f -K "$CURL_CFG" -H 'Content-Type: application/json' \
         --data-binary "$2" "$IMMICH_URL/api$1"
@@ -372,13 +321,13 @@ refresh_free() {
 file_size_kb() {
     local bytes
     bytes="$(stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0)"
-    echo $(( (bytes + 1023) / 1024 ))
+    echo $(((bytes + 1023) / 1024))
 }
 
 write_protect_file() {
-    : > "$PROTECT_FILE"
+    : >"$PROTECT_FILE"
     if [ "${#batch_names[@]}" -gt 0 ]; then
-        printf '%s\n' "${batch_names[@]}" > "$PROTECT_FILE"
+        printf '%s\n' "${batch_names[@]}" >"$PROTECT_FILE"
     fi
 }
 
@@ -395,13 +344,13 @@ filter_protected() {
 prune_remote() {
     local need_kb="${1:-0}"
     local deleted=0
-    local target_kb=$(( MIN_FREE_MB * 1024 + need_kb ))
+    local target_kb=$((MIN_FREE_MB * 1024 + need_kb))
     local raw="$WORK_DIR/prune.raw"
 
     write_protect_file
 
     "${ADB[@]}" shell find "$REMOTE_DIR" -type f -mtime "+$KEEP_DAYS" 2>/dev/null </dev/null |
-        tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d' > "$raw" || true
+        tr -d '\r' | sed "s|^$REMOTE_DIR/||" | sed '/^$/d' >"$raw" || true
 
     local -a stale=()
     while read -r name; do
@@ -413,7 +362,7 @@ prune_remote() {
             info "would prune ${#stale[@]} file(s) older than $KEEP_DAYS days"
         else
             transport_delete "${stale[@]}"
-            deleted=$(( deleted + ${#stale[@]} ))
+            deleted=$((deleted + ${#stale[@]}))
         fi
     fi
 
@@ -426,7 +375,7 @@ prune_remote() {
 
     if [ "$FREE_KB" -lt "$target_kb" ]; then
         # Oldest indexed file first: it has had the longest to upload.
-        transport_list_oldest_first > "$raw"
+        transport_list_oldest_first >"$raw"
         local -a oldest=()
         while read -r name; do
             [ -n "$name" ] && oldest+=("$name")
@@ -440,8 +389,8 @@ prune_remote() {
                 break
             fi
             transport_delete "${batch[@]}"
-            deleted=$(( deleted + ${#batch[@]} ))
-            i=$(( i + 40 ))
+            deleted=$((deleted + ${#batch[@]}))
+            i=$((i + 40))
             refresh_free
             [ "$FREE_KB" -lt 0 ] && break
         done
@@ -455,7 +404,7 @@ prune_remote() {
 # Returns non-zero when the device still cannot fit it.
 ensure_space() {
     local need_kb="$1"
-    local target_kb=$(( MIN_FREE_MB * 1024 + need_kb ))
+    local target_kb=$((MIN_FREE_MB * 1024 + need_kb))
 
     if [ "$FREE_KB" -lt 0 ] || [ "$FREE_KB" -ge "$target_kb" ]; then
         return 0
@@ -482,7 +431,7 @@ info "Immich  $IMMICH_URL  (user: $immich_user)"
 info "Cursor  $cursor"
 
 PENDING="$WORK_DIR/pending.tsv"
-: > "$PENDING"
+: >"$PENDING"
 
 page=1
 while :; do
@@ -506,7 +455,7 @@ while :; do
             (if (.originalFileName // "") == "" then "unnamed" else .originalFileName end)
           ]
         | @tsv
-    ' <<<"$resp" >> "$PENDING"
+    ' <<<"$resp" >>"$PENDING"
 
     next="$(jq -r '.assets.nextPage // empty' <<<"$resp")"
     [ -n "$next" ] || break
@@ -516,7 +465,7 @@ done
 # Ascending updatedAt so the cursor only ever advances past finished work.
 sort -t$'\t' -k2,2 -o "$PENDING" "$PENDING"
 
-total="$(wc -l < "$PENDING" | tr -d ' ')"
+total="$(wc -l <"$PENDING" | tr -d ' ')"
 if [ "$total" -eq 0 ]; then
     ok "nothing new"
     exit 0
@@ -530,7 +479,7 @@ QUEUE="$WORK_DIR/queue.tsv"
 awk -F'\t' -v pushed="$PUSHED_FILE" '
     FILENAME == pushed { seen[$1] = 1; next }
     { print (($1 in seen) ? "skip" : "send") "\t" $0 }
-' "$PUSHED_FILE" "$PENDING" > "$QUEUE"
+' "$PUSHED_FILE" "$PENDING" >"$QUEUE"
 
 # ------------------------------------------------------------
 # TRANSFER
@@ -586,16 +535,16 @@ flush_batch() {
         while [ "$i" -lt "$total" ]; do
             while read -r verdict <&3; do
                 if [ "$done_n" -lt "$total" ]; then
-                    [ "$verdict" = "N" ] && failures=$(( failures + 1 ))
-                    render_progress "$done_n" "$total" 0 $(( SECONDS - t0 )) \
+                    [ "$verdict" = "N" ] && failures=$((failures + 1))
+                    render_progress "$done_n" "$total" 0 $((SECONDS - t0)) \
                         "indexing ${batch_names[done_n]#*_}"
                 fi
-                done_n=$(( done_n + 1 ))
+                done_n=$((done_n + 1))
             done 3< <(transport_scan_batch "${batch_names[@]:i:SCAN_CHUNK}")
-            i=$(( i + SCAN_CHUNK ))
+            i=$((i + SCAN_CHUNK))
         done
         # Fewer replies than files means the remote shell died partway through.
-        [ "$done_n" -lt "$total" ] && failures=$(( failures + total - done_n ))
+        [ "$done_n" -lt "$total" ] && failures=$((failures + total - done_n))
     fi
 
     if [ "$failures" -gt 0 ]; then
@@ -607,9 +556,9 @@ flush_batch() {
         fi
     fi
 
-    printf '%s\n' "${batch_ids[@]}" >> "$PUSHED_FILE"
+    printf '%s\n' "${batch_ids[@]}" >>"$PUSHED_FILE"
     advance_cursor "$batch_cursor"
-    indexed=$(( indexed + total ))
+    indexed=$((indexed + total))
     batch_names=()
     batch_ids=()
     return 0
@@ -626,8 +575,8 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
     fi
 
     if [ "$state" = "skip" ]; then
-        skipped=$(( skipped + 1 ))
-        processed=$(( processed + 1 ))
+        skipped=$((skipped + 1))
+        processed=$((processed + 1))
         # With a batch outstanding, this timestamp is ahead of uncommitted work,
         # so it has to be committed by the flush rather than immediately.
         if [ "${#batch_names[@]}" -eq 0 ]; then
@@ -645,13 +594,13 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
 
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '  would push  %s\n' "$remote_name"
-        pushed=$(( pushed + 1 ))
-        processed=$(( processed + 1 ))
+        pushed=$((pushed + 1))
+        processed=$((processed + 1))
         advance_cursor "$updated_at"
         continue
     fi
     # Drawn before the download so a slow fetch still shows the current file.
-    render_progress "$pushed" "$to_send" "$sent_kb" $(( SECONDS - start_time )) "${remote_name#*_}"
+    render_progress "$pushed" "$to_send" "$sent_kb" $((SECONDS - start_time)) "${remote_name#*_}"
 
     # Prefer the local library file; fall back to the API when Immich does not
     # expose originalPath or the path is not readable from here.
@@ -661,7 +610,7 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
         src="$WORK_DIR/download.bin"
         if ! curl -sS -f -K "$CURL_CFG" -o "$src" "$IMMICH_URL/api/assets/$id/original"; then
             warn "download failed: $id ($orig_name)"
-            failed=$(( failed + 1 ))
+            failed=$((failed + 1))
             cursor_frozen=1
             continue
         fi
@@ -686,27 +635,27 @@ while IFS=$'\t' read -r state id updated_at orig_path orig_name <&3; do
         batch_names+=("$remote_name")
         batch_ids+=("$id")
         batch_cursor="$updated_at"
-        pushed=$(( pushed + 1 ))
-        processed=$(( processed + 1 ))
+        pushed=$((pushed + 1))
+        processed=$((processed + 1))
         if [ "$FREE_KB" -ge 0 ]; then
-            FREE_KB=$(( FREE_KB - need_kb ))
+            FREE_KB=$((FREE_KB - need_kb))
         fi
-        sent_kb=$(( sent_kb + need_kb ))
+        sent_kb=$((sent_kb + need_kb))
         if [ "${#batch_names[@]}" -ge "$BATCH_SIZE" ]; then
             flush_batch
         fi
     else
         warn "push failed: $remote_name"
-        failed=$(( failed + 1 ))
+        failed=$((failed + 1))
         cursor_frozen=1
         refresh_free
     fi
 
     [ "$downloaded" -eq 1 ] && rm -f "$src"
-done 3< "$QUEUE"
+done 3<"$QUEUE"
 
 flush_batch
-render_progress "$pushed" "$to_send" "$sent_kb" $(( SECONDS - start_time )) "complete"
+render_progress "$pushed" "$to_send" "$sent_kb" $((SECONDS - start_time)) "complete"
 finish_progress
 
 # ------------------------------------------------------------
