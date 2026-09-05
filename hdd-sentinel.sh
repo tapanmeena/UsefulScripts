@@ -65,6 +65,8 @@ LOAD_CYCLE_NORM_WARN="${LOAD_CYCLE_NORM_WARN:-20}"
 HISTORY_DAYS="${HISTORY_DAYS:-90}"
 # Short windows measure noise: head parking is bursty and tied to workload.
 MIN_RATE_HOURS="${MIN_RATE_HOURS:-6}"
+# Below this much movement the observed rate is too small to project from.
+MIN_RATE_DELTA="${MIN_RATE_DELTA:-50}"
 
 QUIET=0
 AS_JSON=0
@@ -347,9 +349,9 @@ record_history() {
     awk -F"$TAB" -v c="$cutoff" '$1 >= c' "$hist" >"$hist.tmp" && mv "$hist.tmp" "$hist"
 }
 
-# attr_rate <key> <id> -> "per_hour span_hours", empty until the history spans
-# MIN_RATE_HOURS. Counters like load cycles accrue in bursts, so a short window
-# reports either zero or a wildly inflated rate.
+# attr_rate <key> <id> -> "per_hour span_hours delta", empty until the history
+# spans MIN_RATE_HOURS. Counters like load cycles accrue in bursts, so a short
+# window reports either zero or a wildly inflated rate.
 attr_rate() {
     local key="$1" id="$2"
     local hist="$STATE/history-$key.tsv"
@@ -363,7 +365,7 @@ attr_rate() {
             if (ft == "" || lt <= ft) exit 1
             span = (lt - ft) / 3600
             if (span < minh) exit 1
-            printf "%.1f %.1f", (last - first) / span, span
+            printf "%.1f %.1f %d", (last - first) / span, span, last - first
         }' "$hist"
 }
 
@@ -474,11 +476,23 @@ while IFS="$TAB" read -r dev type; do
     lcc_rate='-'
     lcc_proj='-'
     if rate_pair="$(attr_rate "$key" 193)"; then
-        lcc_rate="${rate_pair%% *}"
+        lcc_rate="$(printf '%s' "$rate_pair" | awk '{print $1}')"
+        lcc_delta="$(printf '%s' "$rate_pair" | awk '{print $3}')"
+        rate_src=observed
+
+        # An idle period barely moves the counter, and dividing by that rate
+        # projects centuries. The lifetime average is the honest fallback.
+        if [ "$lcc_delta" -lt "$MIN_RATE_DELTA" ] && [ -n "$hours" ] && [ "$hours" -gt 0 ] 2>/dev/null; then
+            lcc_rate="$(awk -v r="$lcc" -v h="$hours" 'BEGIN { printf "%.1f", r / h }')"
+            rate_src=lifetime
+        fi
+
         if [ -n "$lcc_norm" ] && [ "$lcc_norm" != null ]; then
             lcc_proj="$(project_days "$lcc" "$lcc_norm" "$lcc_rate")"
-            if [ "$lcc_proj" -gt 0 ] 2>/dev/null; then
-                dev_notes="${dev_notes:+$dev_notes; }+${lcc_rate}/h, rated life ends in ~${lcc_proj}d"
+            if [ "$lcc_proj" -gt 3650 ] 2>/dev/null; then
+                dev_notes="${dev_notes:+$dev_notes; }+${lcc_rate}/h ($rate_src), rated life 10y+"
+            elif [ "$lcc_proj" -gt 0 ] 2>/dev/null; then
+                dev_notes="${dev_notes:+$dev_notes; }+${lcc_rate}/h ($rate_src), rated life ends in ~${lcc_proj}d"
             fi
         fi
     fi
