@@ -1,0 +1,28 @@
+# obsidian-daily configuration
+#
+# Copied to ~/.config/obsidian-daily.conf at mode 600 by install.sh.
+# This file is sourced by bash, so quote anything with spaces.
+
+# Vault root. The daily note folder and filename format are read from
+# .obsidian/daily-notes.json inside it, so changing the format in Obsidian
+# does not require editing anything here.
+VAULT="$HOME/Desktop/ObsiSync"
+
+# Directories scanned for git repositories, space separated.
+ROOTS="$HOME/Desktop/Projects"
+
+# Folder inside the vault holding project notes. Repository names that match a
+# note are rendered as wikilinks so entries join the graph.
+PROJECT_NOTES="04 - Projects"
+
+# SSH host for the health line. Leave empty to omit it. Needs key based auth,
+# since the script runs unattended.
+PI_HOST="arcadia"
+
+# Immich, for the daily photo count. Leave empty to omit that section.
+# Point this at the machine running Immich, not at localhost.
+IMMICH_URL=""
+IMMICH_API_KEY=""
+
+# Heading the generated block is filed under.
+SECTION_TITLE="## Machine Log"

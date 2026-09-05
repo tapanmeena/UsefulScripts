@@ -26,10 +26,11 @@ Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external US
 | `hdd-sentinel` | SMART health that alerts on change, plus the USB bus faults SMART cannot see | Pi | smartctl, jq | daily 06:00 |
 | `wan-watch` | Continuous connection quality, bufferbloat grading, and outage records | Pi | ping, awk | probe every minute |
 | `boot-story` | Explains why the machine last rebooted, with ranked evidence | Pi | journalctl | manual |
+| `obsidian-daily` | Writes commits, photo counts and Pi health into the Obsidian daily note | Mac, Pi | git | daily 23:50 |
 | `immich-to-pixel` | Copies new Immich assets to a Pixel over adb so Google Photos backs them up | Pi | curl, jq, adb | manual |
-| `rpistats` | One-screen health dashboard: CPU, memory, storage, network, Docker, Immich | Pi | none | manual |
+| `rpistats` | One-screen health dashboard: CPU, memory, storage, network, Docker, Immich | Pi | awk | manual |
 
-Additional scripts land as each phase completes. See the [roadmap](#roadmap).
+Every script supports `--help`, and every script that can change something supports `--dry-run`.
 
 ## Quickstart
 
@@ -148,13 +149,13 @@ The fallback is only reached when the script runs through a symlink, and the ins
 | Output | `info`, `ok`, `warn`, `die`, `debug`, `section`, `kv` |
 | Progress | `render_progress`, `clear_progress`, `finish_progress` |
 | Config and state | `load_config`, `state_dir`, `require_tools`, `require_linux` |
-| Concurrency | `with_lock`, `on_exit` |
+| Concurrency | `with_lock`, `acquire_lock`, `on_exit` |
 | Alerting | `notify`, `notify_dedupe` |
 | Formatting | `human_bytes`, `human_duration`, `sparkline` |
 | Portability | `_realpath`, `stat_size`, `stat_mode`, `stat_mtime`, `sed_inplace`, `date_days_ago`, `is_macos`, `is_linux`, `is_utf8` |
 | Data | `csv_append`, `retry` |
 
-`with_lock` uses `flock` where it exists and falls back to an atomic `mkdir` with a PID file on macOS, which has no `flock` binary. It reaps locks left behind by killed runs and returns 75 when another copy holds the lock.
+`with_lock` uses `flock` where it exists and falls back to an atomic `mkdir` with a PID file on macOS, which has no `flock` binary. It reaps locks left behind by killed runs and returns 75 when another copy holds the lock. The command runs in the current shell, so it may be a function; `flock <file> <cmd>` cannot do that because it execs. Linear scripts that cannot wrap their work in a function use `acquire_lock` instead, which holds the lock until the process exits.
 
 `on_exit` maintains a handler stack because bash traps overwrite each other, so the library and the script would otherwise fight over `EXIT`.
 
@@ -169,11 +170,13 @@ The installer reads this table from `install.sh` and generates the platform unit
 | `disk-runway` | Hourly | `--sample` |
 | `obsidian-daily` | Daily at 23:50 | none |
 
+Scripts are installed only on the platform their banner declares, so the Pi gets `hdd-sentinel` and `wan-watch` while the Mac gets `obsidian-daily`.
+
 Check what is actually running with `./install.sh --check`.
 
 ## Roadmap
 
-Foundation and the Mac-side scripts are complete. Remaining scripts arrive in phases.
+All planned scripts are built and running.
 
 | Phase | Scripts | Status |
 |-------|---------|--------|
@@ -181,7 +184,7 @@ Foundation and the Mac-side scripts are complete. Remaining scripts arrive in ph
 | 1 | `repo-sweep`, `space-hog` | Done |
 | 2 | `disk-runway`, `hdd-sentinel` | Done |
 | 3 | `wan-watch`, `boot-story` | Done |
-| 4 | `obsidian-daily`, plus retrofitting the two original scripts onto the library | Pending |
+| 4 | `obsidian-daily`, plus retrofitting the two original scripts onto the library | Done |
 
 ## Development
 
