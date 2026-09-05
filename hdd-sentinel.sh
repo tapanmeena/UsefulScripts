@@ -304,10 +304,25 @@ NOTES="$WORK_DIR/notes.txt"
 PRESENT="$WORK_DIR/present.tsv"
 : >"$PRESENT"
 
-# The five Backblaze found actually predict failure, plus load cycles, which
-# USB enclosures burn through by parking heads aggressively.
-CRITICAL_IDS="5 187 188 197 198"
+# The five Backblaze found actually predict failure, plus 199, which counts CRC
+# failures on the link itself. A high 199 with zero media errors means the
+# cable or bridge is corrupting transfers while the platters are perfect, and
+# that is the common failure for USB attached disks.
+CRITICAL_IDS="5 187 188 197 198 199"
 INFO_IDS="9 12 193"
+
+attr_label() {
+    case "$1" in
+        5) echo Reallocated ;;
+        187) echo Reported_Uncorrect ;;
+        188) echo Command_Timeout ;;
+        193) echo Load_Cycles ;;
+        197) echo Pending_Sector ;;
+        198) echo Offline_Uncorrect ;;
+        199) echo Link_CRC ;;
+        *) echo "attr $1" ;;
+    esac
+}
 
 attr() {
     printf '%s' "$1" | jq -r --argjson id "$2" '
@@ -421,11 +436,16 @@ while IFS="$TAB" read -r dev type; do
         prev=''
         [ -f "$snap" ] && prev="$(awk -F"$TAB" -v i="$id" '$1 == i { print $2; exit }' "$snap")"
 
+        label="$(attr_label "$id")"
+        hint=''
+        # 199 counts link errors, so the remedy is a cable, not a disk.
+        [ "$id" = 199 ] && hint=' (cable or bridge, not the platters)'
+
         if [ -n "$prev" ] && [ "$v" -gt "$prev" ]; then
-            dev_notes="${dev_notes:+$dev_notes; }attr $id rose $prev->$v"
+            dev_notes="${dev_notes:+$dev_notes; }$label rose $prev->$v$hint"
             level=crit
         elif [ "$v" -gt 0 ]; then
-            dev_notes="${dev_notes:+$dev_notes; }attr $id = $v (stable)"
+            dev_notes="${dev_notes:+$dev_notes; }$label = $v (stable)$hint"
             [ "$level" = ok ] && level=warn
         fi
     done
