@@ -163,6 +163,7 @@ do_sample() {
 $(discover_mounts)
 EOF
     [ "$QUIET" -eq 1 ] || ok "recorded $count mount(s) to $SAMPLES"
+    do_report
 }
 
 # ------------------------------------------------------------
@@ -220,10 +221,42 @@ rate_text() {
     }'
 }
 
+cache_forecast() {
+    local rows="$1" worst="$2" level=ok checked_at
+    local mp used total free slope7 slope30 runway r2 _samples flag row_level outlook
+    checked_at="$(awk -F "$TAB" '$1 > latest { latest = $1 } END { printf "%.0f", latest }' "$SAMPLES")"
+    if [ ! -s "$rows" ]; then
+        printf 'Forecast\tunknown\tNot enough history; need at least 3 samples per mount\n' |
+            write_status_snapshot disk-runway unknown "$checked_at" || warn 'could not cache disk runway status'
+        return 0
+    fi
+    if [ "$worst" -lt "$CRIT_DAYS" ]; then
+        level=crit
+    elif [ "$worst" -lt "$WARN_DAYS" ]; then
+        level=warn
+    fi
+    while IFS="$TAB" read -r mp used total free slope7 slope30 runway r2 _samples flag; do
+        row_level=ok
+        outlook='no projected fill'
+        if [ "$runway" -ge 0 ]; then
+            outlook="~${runway} days left"
+            if [ "$runway" -lt "$CRIT_DAYS" ]; then
+                row_level=crit
+            elif [ "$runway" -lt "$WARN_DAYS" ]; then
+                row_level=warn
+            fi
+        fi
+        [ "$flag" = '-' ] || outlook="$outlook; $flag"
+        printf '%s\t%s\t%s/day; %s; R2 %s\n' "$mp" "$row_level" "$(rate_text "$slope7")" "$outlook" "$r2"
+    done <"$rows" | write_status_snapshot disk-runway "$level" "$checked_at" || warn 'could not cache disk runway status'
+}
+
 do_report() {
     if [ ! -s "$SAMPLES" ]; then
         # Not an error: the timer has simply not run yet.
-        [ "$QUIET" -eq 1 ] || info "no samples yet. Run disk-runway --sample, or wait for the hourly timer."
+        printf 'Forecast\tunknown\tNo samples recorded\n' |
+            write_status_snapshot disk-runway unknown || warn 'could not cache disk runway status'
+        [ "$QUIET" -eq 1 ] || [ "$MODE" = sample ] || info "no samples yet. Run disk-runway --sample, or wait for the hourly timer."
         exit "$EX_OK"
     fi
 
@@ -278,6 +311,12 @@ do_report() {
     done <<EOF
 $(discover_mounts)
 EOF
+
+    cache_forecast "$rows" "$worst"
+    if [ "$MODE" = sample ]; then
+        rm -f "$rows"
+        return 0
+    fi
 
     if [ ! -s "$rows" ]; then
         rm -f "$rows"

@@ -158,7 +158,7 @@ if [ "$HAVE_PREVIOUS" -eq 1 ]; then
     fi
 
     prev_oom="$(printf '%s' "$(jrn -b -1 --no-pager)" |
-        grep -iE 'Out of memory: Kill|oom-kill|oom_reaper' | tail -1)"
+        grep -iE 'Out of memory: Kill|oom-kill|oom_reaper' | tail -1 || true)"
     if [ -n "$prev_oom" ]; then
         HAS_OOM=1
         OOM_VICTIM="$(printf '%s' "$prev_oom" | sed -n 's/.*[Kk]illed process [0-9]* (\([^)]*\)).*/\1/p')"
@@ -302,6 +302,22 @@ RC="$EX_OK"
 [ "$CLEAN_SHUTDOWN" = no ] && RC="$EX_WARN"
 [ "$HAS_FS_RECOVERY" -eq 1 ] && [ "$RC" -lt "$EX_WARN" ] && RC="$EX_WARN"
 [ "$HAS_DATA_LOSS" -eq 1 ] && RC="$EX_CRIT"
+
+SNAPSHOT_LEVEL="$(awk -F "$TAB" '
+    BEGIN { level = "ok" }
+    $1 == "crit" { level = "crit" }
+    $1 == "warn" && level == "ok" { level = "warn" }
+    END { print level }
+' "$FINDINGS")"
+if [ "$VERDICT" = 'CLEAN OR UNKNOWN' ] && [ "$SNAPSHOT_LEVEL" = ok ]; then
+    SNAPSHOT_LEVEL=unknown
+fi
+{
+    printf 'Cause\t%s\t%s (%s confidence)\n' "$SNAPSHOT_LEVEL" "$VERDICT" "$CONFIDENCE"
+    if [ -n "$SUGGESTION" ]; then
+        printf 'Action\t%s\t%s\n' "$SNAPSHOT_LEVEL" "$SUGGESTION"
+    fi
+} | write_status_snapshot boot-story "$SNAPSHOT_LEVEL" || warn 'could not cache boot status'
 
 # ------------------------------------------------------------
 # OUTPUT

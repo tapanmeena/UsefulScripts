@@ -12,8 +12,6 @@ keywords:
   - automation
 ---
 
-# UsefulScripts
-
 Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external USB drives, plus a macOS development machine. Each script stands alone, shares one small library, and installs as a scheduled job when that makes sense.
 
 ## Scripts
@@ -28,7 +26,7 @@ Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external US
 | `boot-story` | Explains why the machine last rebooted, with ranked evidence | Pi | journalctl | manual |
 | `obsidian-daily` | Writes commits, photo counts and Pi health into the Obsidian daily note | Mac, Pi | git | daily 23:50 |
 | `immich-to-pixel` | Copies new Immich assets to a Pixel over adb so Google Photos backs them up | Pi | curl, jq, adb | manual |
-| `rpistats` | One-screen health dashboard: CPU, memory, storage, network, Docker, Immich | Pi | awk | manual |
+| `rpistats` | System health plus cached storage forecasts, drive health, WAN quality, and reboot context | Pi | awk | manual |
 
 Every script supports `--help`, and every script that can change something supports `--dry-run`.
 
@@ -61,6 +59,59 @@ That syncs the repository over rsync, then runs the installer on the remote host
 | `--target HOST` | rsync to `HOST` and install there over SSH |
 | `--uninstall` | Remove symlinks and timers, leaving configs and state untouched |
 | `--dry-run` | Print the plan without changing anything |
+
+## Cached monitoring in rpistats
+
+`rpistats` reads the latest summaries from the monitoring scripts. Opening the
+dashboard does not run those scripts, send notifications, probe the network,
+query SMART, or update their comparison baselines. Its existing live CPU, memory,
+filesystem, service, and container checks still run.
+
+- Storage forecasts refresh with `disk-runway --sample` or `--report` and expire
+  after two hours.
+- SMART and USB/I/O findings refresh with `hdd-sentinel`, including `--json`, and
+  expire after 26 hours.
+- The latest probe and 24-hour WAN report refresh with `wan-watch --probe` and
+  expire after five minutes.
+- The reboot verdict and confidence refresh with `boot-story`, including
+  `--quiet`, and remain valid until the next boot by default.
+
+The existing hourly, daily, and per-minute jobs refresh the first three
+summaries. Run `boot-story` after each reboot to refresh its verdict; it is not
+scheduled automatically. Run producers as the same user as `rpistats`, with the
+same `XDG_STATE_HOME`. HDD checks can still use passwordless sudo internally.
+
+Disk sampling remains silent with `--quiet` and does not send forecast
+notifications. Explicit disk reports keep their existing alerts and exit codes.
+A forecast needs at least three time-separated samples, and its timestamp comes
+from the latest sample, not the time you opened the report.
+
+Use [examples/rpistats.conf.example](examples/rpistats.conf.example) for the
+dashboard settings. `STATUS_SOURCES` selects a space-separated subset of
+`disk-runway hdd-sentinel wan-watch boot-story`; set it to an empty string to
+disable all cached summaries. `RUNWAY_MAX_AGE`, `HDD_MAX_AGE`, `WAN_MAX_AGE`, and
+`BOOT_MAX_AGE` are non-negative integer seconds. Zero disables age-based expiry,
+but a changed boot ID always makes an older snapshot stale.
+
+Missing state and configuration are shown as `not configured`. A configured
+source without a readable, valid snapshot is `unavailable`. Missing measurements,
+sleeping drives, or an indeterminate reboot cause are `unknown`, not healthy.
+Stale results remain visible with their age and previous severity. Cache write
+failures leave the previous snapshot intact and do not change the producer's
+health exit code.
+
+`rpistats --oneline` keeps the existing fields and ` | ` separators, then appends
+compact `runway`, `hdd`, `wan`, and `boot` status fields. It does not add sample
+ages or fluctuating WAN statistics to daily notes. Cached warnings do not change
+the dashboard's exit code.
+
+Snapshots are private files at
+`${XDG_STATE_HOME:-$HOME/.local/state}/<source>/status.tsv`. The shared
+`write_status_snapshot NAME LEVEL [EPOCH]` helper reads tab-separated `label`,
+`severity`, and `summary` rows from stdin and replaces the snapshot atomically.
+Its header contains format version `1`, epoch seconds, overall severity, and boot
+ID. Valid severities are `ok`, `warn`, `crit`, and `unknown`; the dashboard
+validates this format and never sources it as shell code.
 
 ## Conventions
 
@@ -157,7 +208,7 @@ The fallback is only reached when the script runs through a symlink, and the ins
 |-------|-----------|
 | Output | `info`, `ok`, `warn`, `die`, `debug`, `section`, `kv` |
 | Progress | `render_progress`, `clear_progress`, `finish_progress` |
-| Config and state | `load_config`, `state_dir`, `require_tools`, `require_linux` |
+| Config and state | `load_config`, `state_dir`, `write_status_snapshot`, `require_tools`, `require_linux` |
 | Concurrency | `with_lock`, `acquire_lock`, `on_exit` |
 | Alerting | `notify`, `notify_dedupe` |
 | Formatting | `human_bytes`, `human_duration`, `sparkline` |
@@ -198,9 +249,19 @@ All planned scripts are built and running.
 ## Development
 
 ```sh
-shellcheck -x -s bash lib/common.sh *.sh
+shellcheck -x -s bash lib/common.sh *.sh .github/*.sh tests/*.sh
 shfmt -d -i 4 -ci .
-bash -n lib/common.sh *.sh
+for script in lib/common.sh *.sh .github/*.sh tests/*.sh; do
+  bash -n "$script"
+done
+for test_script in tests/*.sh; do
+  bash "$test_script"
+done
 ```
 
-Continuous integration runs the same checks, plus a lint pass that rejects bash 4 constructs in files whose banner declares them bash 3.2 safe.
+The cached monitoring tests use temporary state directories and mocked Linux,
+SMART, and network commands. They do not need a Pi or access real monitoring
+state. They require bash, awk, and jq.
+
+Continuous integration runs these checks and fixture tests, plus a lint pass that
+rejects bash 4 constructs in files whose banner declares them bash 3.2 safe.

@@ -24,7 +24,13 @@ jobs:
           exit $fail
 
       - name: shellcheck
-        run: shellcheck -x -s bash lib/common.sh ./*.sh .github/*.sh
+        run: shellcheck -x -s bash lib/common.sh ./*.sh .github/*.sh tests/*.sh
+
+      - name: Cached monitoring tests
+        run: |
+          for test_script in tests/*.sh; do
+            bash "$test_script"
+          done
 
       - name: shfmt
         run: |

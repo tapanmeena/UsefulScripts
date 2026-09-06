@@ -327,6 +327,23 @@ state_dir() {
     printf '%s\n' "$dir"
 }
 
+write_status_snapshot() {
+    local name="$1" level="$2" dir temporary checked_at boot_id='-'
+    dir="${XDG_STATE_HOME:-$HOME/.local/state}/$name"
+    mkdir -p "$dir" || return 1
+    temporary="$(mktemp "$dir/.status.XXXXXX")" || return 1
+    checked_at="${3:-$(date +%s)}"
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        IFS= read -r boot_id </proc/sys/kernel/random/boot_id || boot_id='-'
+    fi
+    if { printf '1\t%s\t%s\t%s\n' "$checked_at" "$level" "$boot_id" && cat; } >"$temporary" &&
+        mv -f "$temporary" "$dir/status.tsv"; then
+        return 0
+    fi
+    rm -f "$temporary"
+    return 1
+}
+
 # ------------------------------------------------------------
 # EXIT HANDLERS
 #

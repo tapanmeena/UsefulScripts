@@ -1,0 +1,12 @@
+SERVICES="ssh docker"
+IMMICH_CONTAINERS="immich_postgres=PostgreSQL immich_server=Server immich_redis=Cache immich_machine_learning=ML"
+TEMP_WARN=60
+TEMP_CRIT=70
+DISK_WARN=85
+DISK_CRIT=95
+ROOT_WARN=90
+STATUS_SOURCES="disk-runway hdd-sentinel wan-watch boot-story"
+RUNWAY_MAX_AGE=7200
+HDD_MAX_AGE=93600
+WAN_MAX_AGE=300
+BOOT_MAX_AGE=0

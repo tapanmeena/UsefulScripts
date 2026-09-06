@@ -47,6 +47,11 @@ TEMP_CRIT="${TEMP_CRIT:-70}"
 DISK_WARN="${DISK_WARN:-85}"
 DISK_CRIT="${DISK_CRIT:-95}"
 ROOT_WARN="${ROOT_WARN:-90}"
+STATUS_SOURCES="${STATUS_SOURCES-disk-runway hdd-sentinel wan-watch boot-story}"
+RUNWAY_MAX_AGE="${RUNWAY_MAX_AGE:-7200}"
+HDD_MAX_AGE="${HDD_MAX_AGE:-93600}"
+WAN_MAX_AGE="${WAN_MAX_AGE:-300}"
+BOOT_MAX_AGE="${BOOT_MAX_AGE:-0}"
 
 ONELINE=0
 
@@ -61,6 +66,10 @@ Usage: rpistats.sh [options]
 
 Settings (config file wins over environment):
   SERVICES, IMMICH_CONTAINERS, TEMP_WARN, TEMP_CRIT, DISK_WARN, DISK_CRIT
+    STATUS_SOURCES, RUNWAY_MAX_AGE, HDD_MAX_AGE, WAN_MAX_AGE, BOOT_MAX_AGE
+
+Monitoring summaries read cached results only. MAX_AGE settings are seconds;
+0 disables age expiry. Results from another boot are always stale.
 EOF
 }
 
@@ -80,6 +89,25 @@ done
 
 # Checked after argument parsing so --help works on any platform.
 require_linux
+
+for CACHE_SETTING in RUNWAY_MAX_AGE HDD_MAX_AGE WAN_MAX_AGE BOOT_MAX_AGE; do
+    CACHE_VALUE="${!CACHE_SETTING}"
+    case "$CACHE_VALUE" in
+        '' | *[!0-9]* | 0[0-9]*) die "$CACHE_SETTING must be a non-negative integer without leading zeros" ;;
+    esac
+    [ "${#CACHE_VALUE}" -le 9 ] || die "$CACHE_SETTING is too large"
+done
+for STATUS_SOURCE in $STATUS_SOURCES; do
+    case "$STATUS_SOURCE" in
+        disk-runway | hdd-sentinel | wan-watch | boot-story) ;;
+        *) die "unknown STATUS_SOURCES entry: $STATUS_SOURCE" ;;
+    esac
+done
+STATUS_NOW="$(date +%s)"
+STATUS_BOOT_ID='-'
+if [ -r /proc/sys/kernel/random/boot_id ]; then
+    IFS= read -r STATUS_BOOT_ID </proc/sys/kernel/random/boot_id || STATUS_BOOT_ID='-'
+fi
 
 # ------------------------------------------------------------
 # MEASUREMENTS
@@ -138,6 +166,91 @@ container_state() {
     fi
 }
 
+cached_summary() {
+    local source="$1" title="$2" key="$3" max_age="$4"
+    local dir="${XDG_STATE_HOME:-$HOME/.local/state}/$source" payload='' rows=''
+    local level=unavailable message='no cached result' checked_at snapshot_boot _version age observed_level
+    local label row_level text color
+    if [ -r "$dir/status.tsv" ]; then
+        if payload="$(LC_ALL=C awk -F '\t' '
+            NR == 1 {
+                if (NF != 4 || $1 != "1" || $2 !~ /^[1-9][0-9]*$/ || length($2) > 12 ||
+                    $3 !~ /^(ok|warn|crit|unknown)$/ || $4 !~ /^[A-Za-z0-9._-]+$/) exit 1
+                print
+                next
+            }
+            {
+                if (NF != 3 || $1 == "" || $3 == "" || $2 !~ /^(ok|warn|crit|unknown)$/ ||
+                    $1 ~ /[[:cntrl:]]/ || $3 ~ /[[:cntrl:]]/) exit 1
+                print
+            }
+            END { if (NR < 2) exit 1 }
+        ' "$dir/status.tsv" 2>/dev/null)"; then
+            IFS="$TAB" read -r _version checked_at level snapshot_boot <<EOF
+$payload
+EOF
+            if [ "$checked_at" -gt "$STATUS_NOW" ]; then
+                level=unavailable
+                message='cached timestamp is in the future'
+            else
+                age=$((STATUS_NOW - checked_at))
+                rows="${payload#*$'\n'}"
+                message="checked $(human_duration "$age") ago"
+                observed_level="$level"
+                if [ "$snapshot_boot" != "$STATUS_BOOT_ID" ]; then
+                    level=stale
+                    message="$message; from a different boot; last result $observed_level"
+                elif [ "$max_age" -gt 0 ] && [ "$age" -gt "$max_age" ]; then
+                    level=stale
+                    message="$message; last result $observed_level"
+                fi
+            fi
+        else
+            message='invalid cached result'
+        fi
+    elif [ ! -e "$dir" ] && [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/$source.conf" ]; then
+        level='not configured'
+    fi
+
+    if [ "$ONELINE" -eq 1 ]; then
+        printf ' | %s %s' "$key" "$level"
+        return 0
+    fi
+
+    section "$title"
+    case "$level" in
+        ok) color="$GREEN" ;;
+        crit) color="$RED" ;;
+        warn | stale | unknown | unavailable) color="$YELLOW" ;;
+        *) color="$DIM" ;;
+    esac
+    printf "%-${KV_WIDTH}s %b%s%b; %s\n" Status "$color" "$level" "$NC" "$message"
+    [ -n "$rows" ] || return 0
+    while IFS="$TAB" read -r label row_level text; do
+        case "$row_level" in
+            ok) color="$GREEN" ;;
+            crit) color="$RED" ;;
+            *) color="$YELLOW" ;;
+        esac
+        [ "$level" != stale ] || color="$DIM"
+        printf "  %-${KV_WIDTH}s %b%s%b; %s\n" "$label" "$color" "$row_level" "$NC" "$text"
+    done <<EOF
+$rows
+EOF
+}
+
+cached_summaries() {
+    local source
+    for source in $STATUS_SOURCES; do
+        case "$source" in
+            disk-runway) cached_summary "$source" 'Storage outlook' runway "$RUNWAY_MAX_AGE" ;;
+            hdd-sentinel) cached_summary "$source" 'Drive health' hdd "$HDD_MAX_AGE" ;;
+            wan-watch) cached_summary "$source" 'Connection quality' wan "$WAN_MAX_AGE" ;;
+            boot-story) cached_summary "$source" 'Last reboot' boot "$BOOT_MAX_AGE" ;;
+        esac
+    done
+}
+
 # ------------------------------------------------------------
 # ONELINE
 # ------------------------------------------------------------
@@ -168,7 +281,9 @@ EOF
         line="$line | immich $down down"
     fi
 
-    printf '%s\n' "$line"
+    printf '%s' "$line"
+    cached_summaries
+    printf '\n'
     exit "$EX_OK"
 fi
 
@@ -263,5 +378,7 @@ for spec in $IMMICH_CONTAINERS; do
     [ -n "$spec" ] || continue
     print_status "${spec#*=}" "$(container_state "${spec%%=*}")"
 done
+
+cached_summaries
 
 printf '\n'

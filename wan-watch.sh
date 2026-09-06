@@ -314,6 +314,7 @@ do_probe() {
     local up=1
     [ -z "$best_rtt" ] && up=0
     record_outage_state "$up"
+    cache_connection "$up" "$gw_rtt" "$best_rtt" "$worst_loss" "$dns"
 
     if [ "$AS_JSON" -eq 1 ]; then
         printf '{"ts":%s,"gw_rtt":"%s","gw_loss":%s,"isp_rtt":"%s","inet_rtt":"%s","inet_loss":%s,"jitter":"%s","dns_ms":%s,"public_ip":"%s","up":%s}\n' \
@@ -481,7 +482,82 @@ do_bloat() {
 # ------------------------------------------------------------
 
 all_samples() {
-    cat "$STATE"/samples-*.csv 2>/dev/null | grep -v '^ts,' || true
+    local files=("$STATE"/samples-*.csv) first
+    if [ "${1:-0}" -gt 0 ] && [ "${#files[@]}" -gt "$1" ]; then
+        first=$((${#files[@]} - $1))
+        files=("${files[@]:first}")
+    fi
+    cat "${files[@]}" 2>/dev/null | grep -v '^ts,' || true
+}
+
+sample_summary() {
+    awk -F, '
+        {
+            total++
+            loss += $6
+            if ($5 != "") {
+                reachable++
+                latency += $5
+                if ($5 + 0 > maximum) maximum = $5
+            }
+        }
+        END {
+            printf "%d %.2f %.1f %.1f %.2f\n", total,
+                total ? reachable / total * 100 : 0,
+                reachable ? latency / reachable : 0, maximum,
+                total ? loss / total : 0
+        }'
+}
+
+cache_connection() {
+    local up="$1" gateway="$2" latency="$3" loss="$4" dns="$5" level=ok state=UP
+    local total reachable average maximum average_loss history_level=ok outage_count=0 longest=0
+    local outage_start=0 _fails _oks cutoff=$((NOW - 86400))
+    if [ "$up" -eq 0 ]; then
+        state=DOWN
+        level=warn
+    elif [ "$dns" -lt 0 ] || awk -v loss="$loss" 'BEGIN { exit !(loss > 0) }'; then
+        level=warn
+    fi
+    read -r total reachable average maximum average_loss <<EOF
+$(all_samples 2 | awk -F, -v cutoff="$cutoff" -v now="$NOW" '$1 >= cutoff && $1 <= now' | sample_summary)
+EOF
+    if awk -v reachable="$reachable" -v loss="$average_loss" 'BEGIN { exit !(reachable < 100 || loss > 0) }'; then
+        history_level=warn
+        level=warn
+    fi
+    if [ -s "$OUTAGES" ]; then
+        read -r outage_count longest <<EOF
+$(awk -F '\t' -v cutoff="$cutoff" -v now="$NOW" '$2 >= cutoff && $2 <= now { count++; if ($3 > longest) longest = $3 } END { print count + 0, longest + 0 }' "$OUTAGES")
+EOF
+    fi
+    read -r _fails _oks outage_start <"$OUTAGE_STATE" || true
+    [ "$outage_start" -eq 0 ] || level=warn
+    if [ "$outage_count" -gt 0 ]; then
+        history_level=warn
+        level=warn
+    fi
+    gateway="${gateway:+$gateway ms}"
+    latency="${latency:+$latency ms}"
+    {
+        printf 'Latest probe\t%s\t%s; gateway %s; internet %s; loss %s%%\n' \
+            "$level" "$state" "${gateway:-unavailable}" "${latency:-unreachable}" "$loss"
+        if [ "$dns" -lt 0 ]; then
+            printf 'DNS\twarn\tResolution failed\n'
+        else
+            printf 'DNS\tok\t%s ms\n' "$dns"
+        fi
+        if [ "$reachable" = 0.00 ]; then
+            printf 'Last 24h\twarn\t0%% sampled reachability (%s samples); latency unavailable; loss %s%%\n' "$total" "$average_loss"
+        else
+            printf 'Last 24h\t%s\t%s%% sampled reachability (%s samples); avg %s ms, worst %s ms; loss %s%%\n' \
+                "$history_level" "$reachable" "$total" "$average" "$maximum" "$average_loss"
+        fi
+        printf 'Outages\t%s\t%s completed in 24h; longest %s\n' "$history_level" "$outage_count" "$(human_duration "$longest")"
+        if [ "$outage_start" -gt 0 ]; then
+            printf 'Outage\twarn\tOpen for %s; awaiting recovery confirmation\n' "$(human_duration "$((NOW - outage_start))")"
+        fi
+    } | write_status_snapshot wan-watch "$level" "$NOW" || warn 'could not cache WAN status'
 }
 
 do_report() {
@@ -494,13 +570,10 @@ do_report() {
         exit "$EX_OK"
     fi
 
-    local total up_n uptime_pct avg_rtt max_rtt avg_loss
-    total="$(printf '%s\n' "$window" | grep -c . || true)"
-    up_n="$(printf '%s\n' "$window" | awk -F, '$5 != "" { n++ } END { print n + 0 }')"
-    uptime_pct="$(awk -v a="$up_n" -v b="$total" 'BEGIN { printf "%.2f", b ? a / b * 100 : 0 }')"
-    avg_rtt="$(printf '%s\n' "$window" | awk -F, '$5 != "" { s += $5; n++ } END { printf "%.1f", n ? s / n : 0 }')"
-    max_rtt="$(printf '%s\n' "$window" | awk -F, '$5 != "" && $5 + 0 > m { m = $5 } END { printf "%.1f", m }')"
-    avg_loss="$(printf '%s\n' "$window" | awk -F, '{ s += $6; n++ } END { printf "%.2f", n ? s / n : 0 }')"
+    local total uptime_pct avg_rtt max_rtt avg_loss
+    read -r total uptime_pct avg_rtt max_rtt avg_loss <<EOF
+$(printf '%s\n' "$window" | sample_summary)
+EOF
 
     if [ "$AS_JSON" -eq 1 ]; then
         printf '{"days":%s,"samples":%s,"uptime_pct":%s,"avg_rtt_ms":%s,"max_rtt_ms":%s,"avg_loss_pct":%s}\n' \

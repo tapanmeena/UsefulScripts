@@ -301,6 +301,8 @@ on_exit cleanup_workdir
 
 ROWS="$WORK_DIR/rows.tsv"
 : >"$ROWS"
+UNAVAILABLE="$WORK_DIR/unavailable.tsv"
+: >"$UNAVAILABLE"
 NOTES="$WORK_DIR/notes.txt"
 : >"$NOTES"
 PRESENT="$WORK_DIR/present.tsv"
@@ -394,6 +396,7 @@ while IFS="$TAB" read -r dev type; do
 
     [ -n "$json" ] || {
         warn "$dev: smartctl returned nothing (type $type)"
+        printf '%s\tunknown\tSMART data unavailable\n' "$dev" >>"$UNAVAILABLE"
         continue
     }
 
@@ -510,7 +513,11 @@ done <<EOF
 $(discover)
 EOF
 
-[ -s "$ROWS" ] || die "no disks reported SMART data. Check: smartctl --scan"
+if [ ! -s "$ROWS" ]; then
+    printf 'Drives\tunknown\tNo disks reported SMART data\n' |
+        write_status_snapshot hdd-sentinel unknown || warn 'could not cache HDD status'
+    die "no disks reported SMART data. Check: smartctl --scan"
+fi
 
 # ------------------------------------------------------------
 # KERNEL SIGNAL DELTAS
@@ -581,6 +588,35 @@ if [ "$FIRST_RUN" -eq 1 ] && { [ "$RESETS" -gt 0 ] || [ "$IOERRS" -gt 0 ]; }; th
 fi
 
 detect_device_changes "$PRESENT"
+
+SNAPSHOT_LEVEL=ok
+if [ "$WORST" -eq 2 ]; then
+    SNAPSHOT_LEVEL=crit
+elif [ "$WORST" -eq 1 ]; then
+    SNAPSHOT_LEVEL=warn
+elif [ -s "$UNAVAILABLE" ] || awk -F "$TAB" '$2 == "standby" || $8 != "true" { unknown = 1 } END { exit !unknown }' "$ROWS"; then
+    SNAPSHOT_LEVEL=unknown
+fi
+{
+    awk -F "$TAB" 'BEGIN { OFS = "\t" }
+        {
+            level = $2
+            if (level == "standby") {
+                print $1, "unknown", "Sleeping; SMART not checked"
+                next
+            }
+            summary = ($8 == "true") ? "SMART passed" : "SMART status unavailable"
+            if (level == "ok" && $8 != "true") level = "unknown"
+            if ($5 != "-") summary = summary "; " $5 "C"
+            if ($11 != "-") summary = summary "; " $11
+            print $1, level, summary
+        }
+    ' "$ROWS"
+    cat "$UNAVAILABLE"
+    printf 'Kernel\t%s\t%s new USB resets; %s new I/O errors; %s over-current events this boot (%s new)\n' \
+        "$SNAPSHOT_LEVEL" "$RESET_DELTA" "$IOERR_DELTA" "$OVERCUR" "$OVERCUR_DELTA"
+    awk -v level="$SNAPSHOT_LEVEL" '{ print "Finding\t" level "\t" $0 }' "$NOTES"
+} | write_status_snapshot hdd-sentinel "$SNAPSHOT_LEVEL" || warn 'could not cache HDD status'
 
 # ------------------------------------------------------------
 # OUTPUT
