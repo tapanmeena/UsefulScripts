@@ -26,7 +26,7 @@ Shell scripts for a Raspberry Pi homelab running Immich, Docker, and external US
 | `boot-story` | Explains why the machine last rebooted, with ranked evidence | Pi | journalctl | manual |
 | `obsidian-daily` | Writes commits, photo counts and Pi health into the Obsidian daily note | Mac, Pi | git | daily 23:50 |
 | `immich-to-pixel` | Copies new Immich assets to a Pixel over adb so Google Photos backs them up | Pi | curl, jq, adb | manual |
-| `rpistats` | System health plus cached storage forecasts, drive health, WAN quality, and reboot context | Pi | awk | manual |
+| `rpistats` | System health plus cached storage forecasts, drive health, WAN quality, and reboot context | Pi | awk, jq | manual |
 
 Every script supports `--help`, and every script that can change something supports `--dry-run`.
 
@@ -59,6 +59,75 @@ That syncs the repository over rsync, then runs the installer on the remote host
 | `--target HOST` | rsync to `HOST` and install there over SSH |
 | `--uninstall` | Remove symlinks and timers, leaving configs and state untouched |
 | `--dry-run` | Print the plan without changing anything |
+
+## Live health in rpistats
+
+`rpistats` collects one set of readings for its human, one-line, or JSON report.
+CPU usage comes from the second `top` sample, with a 0.2-second interval by
+default. RAM usage is total minus available memory, taken from one `free -b`
+snapshot. Missing values are shown as unavailable instead of a bare percent
+sign or an invented zero. Temperature and clock readings fall back to sysfs when
+`vcgencmd` does not provide them.
+
+Container reports distinguish healthy, unhealthy, starting, stopped, and absent
+containers. Running without a health check is reported explicitly. Docker access
+failures are unknown, not proof that containers stopped. Services in transition
+are warnings; failed or inactive configured services are critical. Empty
+`SERVICES` or `IMMICH_CONTAINERS` settings disable those checks.
+
+Power diagnostics decode the current and historical bits of `get_throttled`.
+Active undervoltage or throttling is critical. Frequency caps, temperature-limit
+flags, historical events, and unrecognized bits are warnings. Historical flags
+mean the event occurred since boot, not that it is happening now.
+
+Storage discovery uses `findmnt` JSON instead of assuming every drive is an
+`sdX` partition. Mounted block filesystems, including NVMe and mapper devices,
+are listed with their full paths. Squashfs and ISO images are omitted unless
+explicitly expected. Configure expected mount paths one per line; spaces inside
+a path are preserved:
+
+```sh
+EXPECTED_MOUNTS="/mnt/photos
+/mnt/backup drive"
+```
+
+A missing expected mount is critical, even if its directory still exists on the
+root filesystem. If the mount inventory cannot be read, the check is unknown
+rather than falsely reporting a missing disk. Do not put directory paths here
+unless they are actual mount points.
+
+Temperature defaults are 60/70 degrees Celsius; root usage is 90/95 percent;
+other disks and RAM are 85/95 percent. Warning and critical limits are inclusive
+and must be ordered. These settings and `CPU_SAMPLE_SECONDS` are included in
+[examples/rpistats.conf.example](examples/rpistats.conf.example). Standard Pi
+utilities such as `top`, `free`, `findmnt`, `ip`, and `systemctl` supply the live
+readings; `jq` is required for structured data handling.
+
+### Output and health exits
+
+```sh
+rpistats
+rpistats --oneline
+rpistats --json
+rpistats --json --check
+```
+
+`--json` emits one JSON object with `schema_version: 1`, the overall status,
+`health_exit_code`, system metrics, power flags, filesystems, interfaces,
+services, containers, and cached summaries. Numeric readings remain numbers;
+unavailable readings are `null`. Cached entries include age, the observed
+severity, and findings. JSON and one-line output are mutually exclusive.
+
+`--check` opts into health-based exit codes: 0 for healthy, 1 for warnings or
+unknown required checks, and 2 for critical findings. Configured stale or
+unavailable cache sources count as warnings; unconfigured optional sources do
+not. Without `--check`, a completed report still exits successfully when health
+is degraded, preserving the daily-note integration. Invalid configuration or
+missing required tools can still fail the command.
+
+The existing one-line fields and `cpu`/`ram` prefixes remain compatible with
+Obsidian. A compact `power` field and the cached status fields are appended;
+unhealthy containers and missing expected mounts are named in the summary.
 
 ## Cached monitoring in rpistats
 
@@ -103,7 +172,7 @@ health exit code.
 `rpistats --oneline` keeps the existing fields and ` | ` separators, then appends
 compact `runway`, `hdd`, `wan`, and `boot` status fields. It does not add sample
 ages or fluctuating WAN statistics to daily notes. Cached warnings do not change
-the dashboard's exit code.
+the default exit code; `--check` opts into health-based exits.
 
 Snapshots are private files at
 `${XDG_STATE_HOME:-$HOME/.local/state}/<source>/status.tsv`. The shared
