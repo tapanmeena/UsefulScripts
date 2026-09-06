@@ -11,10 +11,11 @@ export NOTIFY_BACKEND=stdout PROBE_LOG="$WORK_DIR/probes"
 uname() { printf 'Linux\n'; }
 id() { printf '0\n'; }
 dmesg() { printf '%s\n' "${KERNEL_MESSAGES:-}"; }
+lsblk() { printf 'sda disk\n'; }
 smartctl() {
     printf '%s\n' "$*" >>"$PROBE_LOG"
     if [ "$1" = --scan ]; then
-        printf '/dev/test -d sat\n'
+        [ "${SCAN_MODE:-normal}" = empty ] || printf '/dev/test -d sat\n'
     elif [ "${SMART_MODE:-awake}" = sleeping ]; then
         printf '{"smartctl":{"messages":[{"string":"Device is in STANDBY mode"}]}}\n'
     elif [ "${SMART_MODE:-awake}" != missing ]; then
@@ -25,7 +26,7 @@ smartctl() {
         }'
     fi
 }
-export -f uname id dmesg smartctl
+export -f uname id dmesg lsblk smartctl
 
 bash "$REPO_DIR/hdd-sentinel.sh" --json >"$WORK_DIR/result.json"
 jq -e '.disks[0].level == "ok"' "$WORK_DIR/result.json" >/dev/null
@@ -33,6 +34,13 @@ SNAPSHOT="$XDG_STATE_HOME/hdd-sentinel/status.tsv"
 [ "$(awk -F '\t' 'NR == 1 { print $3 }' "$SNAPSHOT")" = ok ]
 grep -q 'SMART passed; 35C' "$SNAPSHOT"
 grep -q -- '-n standby' "$PROBE_LOG"
+
+export SCAN_MODE=empty
+rm "$XDG_STATE_HOME/hdd-sentinel/devices.tsv"
+bash "$REPO_DIR/hdd-sentinel.sh" --json >"$WORK_DIR/result.json"
+jq -e '.disks[0].device == "/dev/sda" and .disks[0].level == "ok"' "$WORK_DIR/result.json" >/dev/null
+grep -q -- '-d sat /dev/sda' "$PROBE_LOG"
+unset SCAN_MODE
 
 export PENDING_SECTORS=2 KERNEL_MESSAGES='I/O error, dev test'
 EXIT_CODE=0

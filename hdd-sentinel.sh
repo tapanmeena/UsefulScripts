@@ -201,13 +201,26 @@ discover() {
         return 0
     fi
     # "/dev/sda -d sat # comment"
-    { smartctl --scan 2>/dev/null || true; } | awk '
+    local scanned
+    scanned="$({ smart --scan; } | awk '
         /^\/dev\// {
             dev = $1
             type = "auto"
             for (i = 1; i < NF; i++) if ($i == "-d") type = $(i + 1)
             print dev "\t" type
-        }'
+        }')"
+    if [ -n "$scanned" ]; then
+        printf '%s\n' "$scanned"
+        return 0
+    fi
+
+    # Some USB bridges answer direct SMART queries but omit themselves from
+    # --scan. Enumerate conventional disk devices and use the existing probe.
+    lsblk -dn -o NAME,TYPE 2>/dev/null |
+        awk '$2 == "disk" && $1 ~ /^(sd|hd|nvme)/ { print "/dev/" $1 }' |
+        while IFS= read -r d; do
+            printf '%s\t%s\n' "$d" "$(device_type "$d" || echo auto)"
+        done
 }
 
 # ------------------------------------------------------------
