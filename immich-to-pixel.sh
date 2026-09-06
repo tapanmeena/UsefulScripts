@@ -167,7 +167,7 @@ IMMICH_URL="${IMMICH_URL%/}"
 [ -n "$IMMICH_API_KEY" ] || die "IMMICH_API_KEY is not set. Create $CONFIG_FILE (mode 600) containing:
   IMMICH_URL=\"http://localhost:2283\"
   IMMICH_API_KEY=\"<key from Immich > Account Settings > API Keys>\"
-  PIXEL_ADDR=\"192.168.1.50:5555\""
+  PIXEL_ADDR=\"192.168.1.6:41653\""
 
 for tool in curl jq adb; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
