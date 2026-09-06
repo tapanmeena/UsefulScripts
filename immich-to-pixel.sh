@@ -32,7 +32,7 @@
 # Values in the config file take precedence over environment variables.
 #
 # Usage:  immich-to-pixel.sh [--dry-run] [--limit N] [--since ISO8601]
-#                            [--batch N] [--scan-volume] [--config PATH]
+#                            [--batch N] [--scan-volume] [--debug] [--config PATH]
 
 set -euo pipefail
 
@@ -56,6 +56,7 @@ Usage: immich-to-pixel.sh [options]
   --batch N        Push N files, then index them, then continue (default 50).
   --scan-volume    Trigger one full MediaStore volume scan per batch instead of
                    scanning each pushed file individually.
+  --debug          Emit verbose trace output for script execution.
   --config PATH    Config file (default ~/.config/immich-to-pixel.conf).
   -h, --help       Show this help.
 
@@ -75,6 +76,7 @@ LIMIT=0
 BATCH_OVERRIDE=""
 SCAN_VOLUME=0
 SINCE_OVERRIDE=""
+VERBOSE="${VERBOSE:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -84,6 +86,10 @@ while [ $# -gt 0 ]; do
             ;;
         --scan-volume)
             SCAN_VOLUME=1
+            shift
+            ;;
+        --debug)
+            VERBOSE=1
             shift
             ;;
         --limit)
@@ -122,6 +128,14 @@ if [ -f "$CONFIG_FILE" ]; then
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
 fi
+
+if [ "$VERBOSE" = "1" ] || [ "$VERBOSE" = "true" ]; then
+    export VERBOSE=1
+else
+    export VERBOSE=""
+fi
+
+debug "using config: $CONFIG_FILE"
 
 IMMICH_URL="${IMMICH_URL:-http://localhost:2283}"
 IMMICH_API_KEY="${IMMICH_API_KEY:-}"
@@ -429,6 +443,10 @@ ensure_space() {
 
 info "Immich  $IMMICH_URL  (user: $immich_user)"
 info "Cursor  $cursor"
+debug "remote dir: $REMOTE_DIR"
+debug "state dir: $STATE_DIR"
+debug "batch size: $BATCH_SIZE"
+[ "$SCAN_VOLUME" -eq 1 ] && debug "full MediaStore volume scan enabled"
 
 PENDING="$WORK_DIR/pending.tsv"
 : >"$PENDING"
@@ -486,6 +504,7 @@ awk -F'\t' -v pushed="$PUSHED_FILE" '
 # ------------------------------------------------------------
 
 transport_connect
+debug "ADB connection ready: ${PIXEL_ADDR}"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 9>&- </dev/null ||
@@ -503,6 +522,8 @@ sent_kb=0
 start_time=$SECONDS
 
 prune_remote
+
+debug "pending send count: $(awk -F'\t' '$1 == "send"' "$QUEUE" | wc -l | tr -d ' ')"
 
 # Denominator for the progress bar: rows that will actually be transferred.
 if [ "$LIMIT" -gt 0 ]; then
