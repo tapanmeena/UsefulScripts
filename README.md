@@ -85,7 +85,9 @@ sudo loginctl enable-linger "$USER"
 
 Only the one-time lingering command uses sudo. Lingering keeps user timers
 running after logout and starts them on boot. The transfer runs as your normal
-user, with output in the systemd journal.
+user, with output in the systemd journal. Generated units are checked with
+`systemd-analyze --user verify` before replacing or enabling the schedule. A
+validation failure leaves the installed units unchanged.
 
 To install or change the schedule to daily at 03:00 in the Pi's local timezone:
 
@@ -104,6 +106,13 @@ Check the schedule, follow logs, or remove the timer:
 ./immich-to-pixel-schedule.sh --status
 journalctl --user -u immich-to-pixel.service -f
 ./immich-to-pixel-schedule.sh --uninstall
+```
+
+If `journalctl --user` reports "No journal files were found", query the system
+journal for this user's service instead:
+
+```sh
+sudo journalctl _SYSTEMD_USER_UNIT=immich-to-pixel.service _UID="$(id -u)" -f
 ```
 
 Removing the schedule leaves the sync configuration, cursor, and any active

@@ -45,6 +45,8 @@ After installation, enable startup without login (one-time setup):
   sudo loginctl enable-linger "$USER"
 
 Logs: journalctl --user -u immich-to-pixel.service -f
+Without a per-user journal:
+    sudo journalctl _SYSTEMD_USER_UNIT=immich-to-pixel.service _UID="$(id -u)" -f
 EOF
 }
 
@@ -100,7 +102,7 @@ Description=Immich to Pixel scheduled transfer
 
 [Service]
 Type=oneshot
-WorkingDirectory=$(unit_quote "$REPO_DIR")
+WorkingDirectory=${REPO_DIR//%/%%}
 Environment=$(unit_quote "PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")
 Environment=$(unit_quote "XDG_CONFIG_HOME=$CONFIG_HOME")
 Environment=$(unit_quote "XDG_STATE_HOME=$STATE_HOME")
@@ -138,6 +140,10 @@ run() {
     fi
 }
 
+cleanup_units() {
+    rm -rf "$UNIT_WORK_DIR"
+}
+
 if [ "$DRY_RUN" -eq 0 ]; then
     is_linux || die "scheduling requires Linux with systemd; use --dry-run to preview"
     [ "$(id -u)" -ne 0 ] || die "run as the Pi user who configured adb and Immich, not root"
@@ -147,7 +153,7 @@ fi
 case "$MODE" in
     status)
         run systemctl --user list-timers --all immich-to-pixel.timer --no-pager
-        run systemctl --user status immich-to-pixel.service --no-pager
+        run systemctl --user status immich-to-pixel.service --no-pager --full
         exit 0
         ;;
     uninstall)
@@ -174,9 +180,14 @@ else
     systemd-analyze calendar -- "$SCHEDULE" >/dev/null || die "invalid calendar: $SCHEDULE"
     [ -f "$CONFIG_HOME/immich-to-pixel.conf" ] || die "create $CONFIG_HOME/immich-to-pixel.conf (mode 600) before scheduling"
     umask 077
+    UNIT_WORK_DIR="$(mktemp -d)"
+    on_exit cleanup_units
+    service_unit >"$UNIT_WORK_DIR/immich-to-pixel.service"
+    timer_unit >"$UNIT_WORK_DIR/immich-to-pixel.timer"
+    systemd-analyze --user verify "$UNIT_WORK_DIR/immich-to-pixel.service" \
+        "$UNIT_WORK_DIR/immich-to-pixel.timer" || die "generated units failed validation; existing schedule left unchanged"
     mkdir -p "$UNIT_DIR"
-    service_unit >"$UNIT_DIR/immich-to-pixel.service"
-    timer_unit >"$UNIT_DIR/immich-to-pixel.timer"
+    mv -f "$UNIT_WORK_DIR/immich-to-pixel.service" "$UNIT_WORK_DIR/immich-to-pixel.timer" "$UNIT_DIR/"
 fi
 
 run systemctl --user daemon-reload
