@@ -60,6 +60,55 @@ That syncs the repository over rsync, then runs the installer on the remote host
 | `--uninstall` | Remove symlinks and timers, leaving configs and state untouched |
 | `--dry-run` | Print the plan without changing anything |
 
+## Scheduled Immich transfers
+
+[immich-to-pixel-schedule.sh](immich-to-pixel-schedule.sh) installs a systemd user
+timer on the Raspberry Pi for this command:
+
+```sh
+./immich-to-pixel.sh --batch 1000 --scan-volume --debug
+```
+
+This schedule is opt-in; the collection installer does not activate it. Use the
+same Pi user whose Immich configuration and adb connection already work. The
+scheduler requires the existing config at
+`${XDG_CONFIG_HOME:-$HOME/.config}/immich-to-pixel.conf` (mode 600), plus `curl`,
+`jq`, and `adb`. It preserves the installer's XDG config and state locations.
+
+From the repository directory on the Pi, preview and install the hourly timer:
+
+```sh
+./immich-to-pixel-schedule.sh --dry-run
+sudo loginctl enable-linger "$USER"
+./immich-to-pixel-schedule.sh
+```
+
+Only the one-time lingering command uses sudo. Lingering keeps user timers
+running after logout and starts them on boot. The transfer runs as your normal
+user, with output in the systemd journal.
+
+To install or change the schedule to daily at 03:00 in the Pi's local timezone:
+
+```sh
+./immich-to-pixel-schedule.sh --schedule '*-*-* 03:00:00'
+```
+
+The timer catches up a missed run when it next starts and does not overlap a
+running transfer. Long transfers have no service startup timeout. The existing
+sync lock also protects against concurrent manual runs. `--batch 1000` controls
+batch size, not the total number of assets transferred per run.
+
+Check the schedule, follow logs, or remove the timer:
+
+```sh
+./immich-to-pixel-schedule.sh --status
+journalctl --user -u immich-to-pixel.service -f
+./immich-to-pixel-schedule.sh --uninstall
+```
+
+Removing the schedule leaves the sync configuration, cursor, and any active
+transfer alone. `--dry-run` also works with `--uninstall`.
+
 ## Live health in rpistats
 
 `rpistats` collects one set of readings for its human, one-line, or JSON report.
