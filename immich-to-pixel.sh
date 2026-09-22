@@ -6,6 +6,7 @@
 #
 # Copies assets newly added to Immich (for the user owning the API key) onto a
 # Pixel over adb, into a folder that Google Photos is configured to back up.
+# Prefers a ready USB device, then falls back to wireless adb.
 #
 # Work proceeds in batches: push BATCH_SIZE files, register them with MediaStore
 # so Google Photos starts uploading, then continue. An asset is only recorded as
@@ -17,18 +18,22 @@
 # Host requirements:  bash, curl, jq, adb
 #
 # One-time phone setup:
-#   1. Enable wireless debugging and pair:   adb pair <ip>:<pairing-port>
-#   2. Pin a stable port (survives until reboot, needs USB once):
-#        adb -d tcpip 5555
-#   3. Google Photos -> Backup -> Back up device folders -> enable "ImmichSync"
-#   4. Settings -> Apps -> Google Photos -> Battery -> Unrestricted
-#   5. Keep the phone on Wi-Fi and charging.
+#   1. Enable USB debugging, connect a data cable, and authorize this host.
+#   2. Google Photos -> Backup -> Back up device folders -> enable "ImmichSync"
+#   3. Settings -> Apps -> Google Photos -> Battery -> Unrestricted
+#   4. Keep the phone on Wi-Fi and charging for Google Photos uploads.
+#
+# Optional wireless fallback:
+#   Enable wireless debugging and pair:   adb pair <ip>:<pairing-port>
+#   Or pin a stable network port until reboot (requires USB):
+#     adb -d tcpip 5555
 #
 # Config file (default ~/.config/immich-to-pixel.conf, mode 600):
 #   IMMICH_URL="http://localhost:2283"
 #   IMMICH_API_KEY="..."
 #   PIXEL_ADDR="192.168.1.50:5555"
 #
+# PIXEL_ADDR is only used for wireless fallback; omit it for mDNS discovery.
 # Values in the config file take precedence over environment variables.
 #
 # Usage:  immich-to-pixel.sh [--dry-run] [--limit N] [--since ISO8601]
@@ -47,6 +52,9 @@ usage() {
     cat <<'EOF'
 Copy assets newly added to Immich onto a Pixel over adb, into a folder that
 Google Photos is configured to back up.
+
+A single ready USB device is preferred. Otherwise, connect wirelessly using
+PIXEL_ADDR, or discover wireless debugging via mDNS when it is unset.
 
 Usage: immich-to-pixel.sh [options]
 
@@ -255,21 +263,34 @@ declare -a ADB=()
 # command, so without this it drains whatever fd 0 happens to be - including the
 # queue being read by the transfer loop.
 transport_connect() {
+    local usb_serial state
+    if usb_serial="$(adb -d get-serialno 2>/dev/null 9>&- </dev/null)" &&
+        [ -n "$usb_serial" ] && [ "$usb_serial" != unknown ] &&
+        state="$(adb -s "$usb_serial" get-state 2>/dev/null 9>&- </dev/null)" &&
+        [ "$state" = device ]; then
+        ADB=(adb -s "$usb_serial")
+        info "ADB connection ready: USB ($usb_serial)"
+        return 0
+    fi
+
+    info "no single ready USB device; trying wireless adb"
     if [ -z "$PIXEL_ADDR" ]; then
-        PIXEL_ADDR="$(adb mdns services 2>/dev/null 9>&- </dev/null |
-            awk '/_adb-tls-connect/ { print $3; exit }')"
+        if ! PIXEL_ADDR="$(adb mdns services 2>/dev/null 9>&- </dev/null |
+            awk '/_adb-tls-connect/ { print $3; exit }')"; then
+            die "wireless adb mDNS discovery failed; set PIXEL_ADDR or connect and authorize the Pixel over USB"
+        fi
         [ -n "$PIXEL_ADDR" ] ||
-            die "no PIXEL_ADDR set and mDNS discovery found no adb-tls-connect service"
+            die "no single ready USB device, no PIXEL_ADDR set and mDNS discovery found no adb-tls-connect service"
         info "discovered device at $PIXEL_ADDR"
     fi
 
     adb connect "$PIXEL_ADDR" >/dev/null 2>&1 9>&- </dev/null || true
     ADB=(adb -s "$PIXEL_ADDR")
 
-    local state
     state="$("${ADB[@]}" get-state 2>/dev/null 9>&- </dev/null || true)"
     [ "$state" = "device" ] ||
         die "device $PIXEL_ADDR is not available (state: ${state:-offline}). Re-pair wireless debugging, or run 'adb -d tcpip 5555' over USB to pin the port."
+    info "ADB connection ready: wireless ($PIXEL_ADDR)"
 }
 
 transport_push() {
@@ -504,7 +525,6 @@ awk -F'\t' -v pushed="$PUSHED_FILE" '
 # ------------------------------------------------------------
 
 transport_connect
-debug "ADB connection ready: ${PIXEL_ADDR}"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     "${ADB[@]}" shell mkdir -p "$REMOTE_DIR" >/dev/null 2>&1 9>&- </dev/null ||

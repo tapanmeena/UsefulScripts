@@ -2,7 +2,7 @@
 title: UsefulScripts
 description: Homelab and workstation shell scripts for a Raspberry Pi running Immich, plus a macOS development machine
 author: tapanmeena
-ms.date: 2026-09-04
+ms.date: 2026-09-22
 ms.topic: reference
 keywords:
   - bash
@@ -59,6 +59,25 @@ That syncs the repository over rsync, then runs the installer on the remote host
 | `--target HOST` | rsync to `HOST` and install there over SSH |
 | `--uninstall` | Remove symlinks and timers, leaving configs and state untouched |
 | `--dry-run` | Print the plan without changing anything |
+
+## Immich transfer connections
+
+[immich-to-pixel.sh](immich-to-pixel.sh) prefers USB for transfers. Enable USB
+debugging on the Pixel, connect it with a data cable, and authorize the Pi on
+the phone. Keep only the Pixel connected as a USB adb device.
+
+If a single USB device is not ready, including when it is unauthorized, offline,
+or multiple USB devices are attached, the script falls back to wireless adb.
+It uses `PIXEL_ADDR` from the existing config, or mDNS discovery when that setting
+is empty. Pair wireless debugging in advance, or use `adb -d tcpip 5555` over USB
+to enable a stable network port until the phone reboots.
+
+Both manual and scheduled runs log the selected connection. Selection happens
+once per run, and all device commands target the selected serial or address.
+If USB disconnects during a transfer, the script does not switch connections
+mid-run; failed assets remain uncommitted so a later run can retry them.
+The phone still needs Wi-Fi for Google Photos uploads, even when files arrive
+over USB.
 
 ## Scheduled Immich transfers
 
@@ -388,7 +407,9 @@ done
 
 The cached monitoring tests use temporary state directories and mocked Linux,
 SMART, and network commands. They do not need a Pi or access real monitoring
-state. They require bash, awk, and jq.
+state. The Immich transport tests mock the API and adb to check USB selection
+and wireless fallback without connecting to a server or phone. Tests require
+bash, awk, and jq.
 
 Continuous integration runs these checks and fixture tests, plus a lint pass that
 rejects bash 4 constructs in files whose banner declares them bash 3.2 safe.
